@@ -1,0 +1,595 @@
+#!/usr/bin/env bash
+#
+# claude-box-dotnet — manage the generic Claude Code .NET dev container for a project.
+#
+#   claude-box-dotnet start   [PROJECT_DIR]   create (first time) or start the container
+#   claude-box-dotnet stop    [PROJECT_DIR]   stop the running container
+#   claude-box-dotnet info    [PROJECT_DIR]   show status/details for the container
+#
+# Manages containers only; the image is built by the sibling build-image script.
+#
+# PROJECT_DIR defaults to the current directory and is bind-mounted at /workspace.
+# The container name is derived deterministically from the project's absolute path
+# (claude-dotnet-<dir>-<hash>), so `stop`/`info` need no saved state — they recompute
+# the same name from the directory. The image must already exist; build it with
+# the sibling build-image script.
+#
+# You CAN run several projects at once: each container gets its own auto-assigned
+# host port, so they never clash. Claude auth/config is shared (one login), while
+# Claude session history (~/.claude/projects) and shell history are per project —
+# every project mounts at /workspace, so without a per-project history volume they
+# would all collide into the same "-workspace" session bucket.
+#
+# Env overrides:
+#   IMAGE         image tag to use/build      (default: claude-dotnet-devcontainer:latest)
+#   PORT          fixed host port -> :8080     (default: auto-assigned, conflict-free)
+#   DB_CONNECTION_STRING  external Postgres, Npgsql format, injected as
+#                 ConnectionStrings__Default   (default: host.docker.internal)
+#   CONTAINER_USER  non-root user inside the image (default: vscode)
+#   PROJECT_CODE_NAME  label shown in the container's shell prompt in place of the
+#                 username (default: the project directory's basename)
+#   CLAUDE_ORG    optional prefix for the secret vars below (CLAUDE_ORG=acme ->
+#                 ACME_CLAUDE_TOKEN_OP_REF); unset means use the plain names
+#
+# Secrets are never stored in this repo or baked into the image; they are resolved
+# on the HOST at start time and injected into the running container. Each is looked
+# up under the CLAUDE_ORG-prefixed name first, then the plain one:
+#   CLAUDE_TOKEN_OP_REF      1Password ref for a long-lived Claude OAuth token
+#   DOCKER_SSH_KEY_OP_REF    1Password ref for the remote Docker host's SSH key
+#   OP_SERVICE_ACCOUNT_TOKEN service-account token so `op` runs non-interactively
+#                            (the prefixed form may also be named <CLAUDE_ORG>_1P_TOKEN)
+#   DOCKER_SSH_KEY           the SSH key material directly, skipping 1Password
+#
+set -euo pipefail
+
+IMAGE="${IMAGE:-claude-dotnet-devcontainer:latest}"
+DB_CONNECTION_STRING="${DB_CONNECTION_STRING:-Host=host.docker.internal;Port=5432;Database=app;Username=postgres;Password=postgres}"
+
+# The non-root user baked into the image (see the Dockerfile's USERNAME arg).
+CONTAINER_USER="${CONTAINER_USER:-vscode}"
+
+# Remote Docker host — the isolated VM where Claude builds/runs/tests containers.
+# These are non-secret (LAN IP + username), hardcoded as defaults but overridable
+# via env. DOCKER_HOST is assembled so `docker`/`docker compose` inside the
+# container run against the remote daemon over SSH, using the key that
+# resolve_ssh_key injects at start time.
+REMOTE_DOCKER_USER="${REMOTE_DOCKER_USER:-dockerizer}"
+REMOTE_DOCKER_HOST="${REMOTE_DOCKER_HOST:-192.168.122.10}"
+
+# Optional namespace for the secret env vars, so several orgs/tenants can coexist
+# in one shell without their references colliding. With CLAUDE_ORG=acme, this
+# script looks for ACME_CLAUDE_TOKEN_OP_REF before falling back to the unprefixed
+# CLAUDE_TOKEN_OP_REF. Leave it unset and only the plain names are used.
+CLAUDE_ORG="$(printf '%s' "${CLAUDE_ORG:-}" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9_' '_')"
+
+# Claude persists its login (auth, credentials, settings) in ~/.claude, backed by
+# this named volume. It MUST be namespaced by CLAUDE_ORG: without that, an
+# org-scoped token would still be written into — and on a later start read back
+# out of — one credentials store shared by every container on the machine, which
+# is exactly the cross-org mix-up the prefix is meant to prevent. Unset
+# CLAUDE_ORG keeps the original volume name, so existing setups keep their login.
+CONFIG_VOLUME="claude-code-config${CLAUDE_ORG:+-$(printf '%s' "$CLAUDE_ORG" | tr '[:upper:]' '[:lower:]')}"
+
+# Where this script REALLY lives, following symlinks. The Docker build context is
+# the .devcontainer/ next to the real script, and the helper is normally invoked
+# through a symlink on PATH (see HOWTO step 2) — without resolving the link we'd
+# look for the Dockerfile next to the LINK and the build would fail. `readlink -f`
+# does this in one step but is GNU-only, so walk the chain by hand for macOS.
+SCRIPT_SRC="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SRC" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SRC")" && pwd)"
+  SCRIPT_SRC="$(readlink "$SCRIPT_SRC")"
+  case "$SCRIPT_SRC" in
+    /*) ;;                              # absolute target: use as-is
+    *) SCRIPT_SRC="$SCRIPT_DIR/$SCRIPT_SRC" ;;   # relative: resolve against the link's dir
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SRC")" && pwd)"
+
+# --- helpers ----------------------------------------------------------------
+
+usage() {
+  cat >&2 <<EOF
+Usage: claude-box-dotnet <command> [PROJECT_DIR]
+
+Commands:
+  start   [DIR]   Create (first time) or start the container for DIR (default: cwd)
+  stop    [DIR]   Stop the running container for DIR
+  rm      [DIR]   Stop and remove the container for DIR (fresh start next time)
+  shell   [DIR]   Open an interactive bash shell inside DIR's container
+  info    [DIR]   Show status and details for DIR's container
+
+PROJECT_DIR defaults to the current directory.
+EOF
+  exit "${1:-2}"
+}
+
+# Prefix a variable name with CLAUDE_ORG when one is set: "FOO" -> "ACME_FOO",
+# or plain "FOO" when CLAUDE_ORG is empty.
+org_var() { printf '%s%s' "${CLAUDE_ORG:+${CLAUDE_ORG}_}" "$1"; }
+
+# Print the value of the first variable in the argument list that is set and
+# non-empty; return 1 if none are. This is what lets every secret be looked up
+# under an org-prefixed name first and a generic name second. Names that aren't
+# valid shell identifiers are skipped rather than fatal — indirect expansion of
+# e.g. "1P_TOKEN" (leading digit) would otherwise abort the script under `set -e`.
+first_env() {
+  local name
+  for name in "$@"; do
+    case "$name" in
+      '' | [0-9]*) continue ;;
+    esac
+    if [ -n "${!name:-}" ]; then
+      printf '%s' "${!name}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The 1Password service-account token, so `op` can read secrets non-interactively.
+# Prefixed form keeps the historical _1P_TOKEN suffix; unprefixed we fall back to
+# OP_SERVICE_ACCOUNT_TOKEN, which is 1Password's own standard variable — if you
+# already export that for the `op` CLI, this script needs no extra configuration.
+op_service_token() {
+  first_env "$(org_var 1P_TOKEN)" "$(org_var OP_SERVICE_ACCOUNT_TOKEN)" \
+            OP_SERVICE_ACCOUNT_TOKEN || true
+}
+
+# Building the image is a MAINTAINER task owned entirely by this sibling script.
+# claude-box-dotnet never invokes it — we only name it so a missing image can point you
+# at the right tool.
+BUILD_SCRIPT="$SCRIPT_DIR/build-image"
+
+# Compute WORKSPACE / HASH / NAME / PROJECT_CODE_NAME from an optional directory
+# argument.
+#
+# PROJECT_CODE_NAME is the project directory's basename, injected into the
+# container so its bash prompt reads "<code-name> ➜ /workspace (branch) $" instead
+# of "<user> ➜ ...". Every project mounts at the same /workspace, so the username
+# and the path are identical in every container — the code name is the only thing
+# in the prompt that says WHICH project a terminal is attached to. Overridable from
+# the shell for directories whose name is unhelpful (src, app, repo).
+resolve_target() {
+  WORKSPACE="$(cd "${1:-$PWD}" && pwd)"
+  HASH="$(printf '%s' "$WORKSPACE" | cksum | cut -d' ' -f1)"
+  NAME="claude-dotnet-$(basename "$WORKSPACE")-${HASH}"
+  PROJECT_CODE_NAME="${PROJECT_CODE_NAME:-$(basename "$WORKSPACE")}"
+}
+
+# Read one secret from 1Password and print it. Args: <op:// reference>.
+# Returns non-zero (printing nothing) if `op` is missing or the read fails; every
+# caller treats that as "carry on without it" rather than a fatal error.
+op_read() {
+  local ref="$1"
+  command -v op >/dev/null 2>&1 || return 1
+  OP_SERVICE_ACCOUNT_TOKEN="$(op_service_token)" op read "$ref" 2>/dev/null
+}
+
+# Resolve a long-lived Claude OAuth token so login survives container recreation.
+# The token is never stored in this repo; it comes from 1Password on the HOST and
+# only the resolved value is passed in.
+#
+# Precedence, most specific first:
+#   1. ${CLAUDE_ORG}_CLAUDE_TOKEN_OP_REF — naming an org-scoped reference is a
+#      deliberate statement about WHICH account this project uses, so it outranks
+#      whatever happens to be sitting in the ambient environment.
+#   2. CLAUDE_CODE_OAUTH_TOKEN already exported — the manual escape hatch.
+#   3. CLAUDE_TOKEN_OP_REF — the unprefixed reference.
+# The source actually used is always printed, and an ambiguous setup says so, so
+# you are never left guessing which account a container logged in as.
+resolve_token() {
+  local ref="" org_ref="" ambient="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+
+  if [ -n "$CLAUDE_ORG" ]; then
+    org_ref="$(first_env "$(org_var CLAUDE_TOKEN_OP_REF)" || true)"
+  fi
+  ref="$org_ref"
+  if [ -z "$ref" ]; then
+    ref="$(first_env CLAUDE_TOKEN_OP_REF || true)"
+  fi
+
+  if [ -n "$org_ref" ] && [ -n "$ambient" ]; then
+    echo "NOTE: CLAUDE_CODE_OAUTH_TOKEN is already exported, but"
+    echo "      CLAUDE_ORG=$CLAUDE_ORG selects $(org_var CLAUDE_TOKEN_OP_REF) —"
+    echo "      using the org-scoped token."
+    CLAUDE_CODE_OAUTH_TOKEN=""
+  elif [ -n "$ambient" ]; then
+    echo "Using the Claude token already exported as CLAUDE_CODE_OAUTH_TOKEN."
+    return 0
+  fi
+
+  if [ -z "$ref" ]; then
+    return 0
+  fi
+  if ! command -v op >/dev/null 2>&1; then
+    echo "WARNING: a Claude token reference is set but the 'op' CLI isn't installed;" >&2
+    echo "         continuing without a token (you'll log in interactively)." >&2
+    return 0
+  fi
+  if ! CLAUDE_CODE_OAUTH_TOKEN="$(op_read "$ref")"; then
+    CLAUDE_CODE_OAUTH_TOKEN=""
+    echo "WARNING: could not read $ref from 1Password;" >&2
+    echo "         continuing without a token (you'll log in interactively)." >&2
+    return 0
+  fi
+  export CLAUDE_CODE_OAUTH_TOKEN
+  echo "Resolved Claude token from 1Password ($ref)."
+}
+
+# Resolve the SSH private key that reaches the remote Docker VM. Same posture as
+# the Claude token: the key is NEVER committed to this repo and NEVER baked into
+# the image — we read it from 1Password on the HOST and inject it into the running
+# container, so the image stays free of secrets.
+# Looked up as ${CLAUDE_ORG}_DOCKER_SSH_KEY_OP_REF, then DOCKER_SSH_KEY_OP_REF —
+# or set DOCKER_SSH_KEY to the key material directly and skip 1Password entirely.
+# Sets SSH_KEY, empty when unavailable — callers warn rather than abort, so you
+# can still work in a container that just can't reach the remote daemon.
+resolve_ssh_key() {
+  local ref
+  SSH_KEY="${DOCKER_SSH_KEY:-}"
+  [ -z "$SSH_KEY" ] || return 0
+
+  if ! ref="$(first_env "$(org_var DOCKER_SSH_KEY_OP_REF)" DOCKER_SSH_KEY_OP_REF)"; then
+    return 0
+  fi
+  if ! command -v op >/dev/null 2>&1; then
+    echo "WARNING: an SSH key reference is set but the 'op' CLI isn't installed." >&2
+    return 0
+  fi
+  if ! SSH_KEY="$(op_read "$ref")"; then
+    SSH_KEY=""
+    echo "WARNING: could not read $ref from 1Password." >&2
+    return 0
+  fi
+  echo "Resolved remote-Docker SSH key from 1Password ($ref)."
+}
+
+# Write the resolved key into the RUNNING container. Deliberate choices:
+#   * over STDIN — not `-e` (the value would show up in `docker inspect`) and not
+#     as an argument (visible in `ps` on the host while the exec runs).
+#   * decoded INSIDE the container, so the plaintext key never lands in a file or
+#     a second process on the host.
+#   * `umask 077` makes the file 600, which ssh insists on.
+# Idempotent, so we re-run it on every start and a recreated container is never
+# left keyless.
+install_ssh_key() {
+  [ -n "${SSH_KEY:-}" ] || return 0
+
+  # The 1Password item stores the key base64-encoded, but DOCKER_SSH_KEY — and
+  # any item someone chooses to store verbatim — is raw PEM. Detect which we have
+  # instead of forcing one: a raw key always carries a "-----BEGIN ... PRIVATE
+  # KEY-----" armour line, which never appears in base64 output.
+  local mode=base64
+  case "$SSH_KEY" in
+    *"-----BEGIN"*) mode=raw ;;
+  esac
+
+  # Decode and validate into a TEMP file, and only move it into place once
+  # ssh-keygen confirms it parses. Writing straight to ~/.ssh/id_rsa would let a
+  # bad secret destroy a key that currently works — and since the image no longer
+  # bakes one in, there would be nothing left to fall back to.
+  #
+  # ssh also rejects a key whose last line has no newline ("invalid format"), and
+  # neither `op read` nor base64 guarantees one, so add it when it's missing.
+  local rc=0
+  printf '%s' "$SSH_KEY" | docker exec -i -u "$CONTAINER_USER" "$NAME" bash -c '
+        umask 077
+        mkdir -p ~/.ssh
+        tmp=~/.ssh/.id_rsa.incoming
+        trap "rm -f $tmp" EXIT
+        # Strip whitespace before decoding: a stray trailing space or wrapped
+        # lines in the 1Password field are common paste artifacts and would
+        # otherwise fail the decode. Raw PEM is passed through untouched, since
+        # there the newlines are structural.
+        if [ "$1" = base64 ]; then
+          tr -d "[:space:]" | base64 -d > "$tmp" 2>/dev/null || exit 2
+        else
+          cat > "$tmp"
+        fi
+        [ -s "$tmp" ] || exit 3
+        [ "$(tail -c1 "$tmp" | wc -l)" -eq 1 ] || printf "\n" >> "$tmp"
+        ssh-keygen -l -f "$tmp" >/dev/null 2>&1 || exit 4
+        mv "$tmp" ~/.ssh/id_rsa
+      ' _ "$mode" || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    case "$rc" in
+      2) echo "WARNING: the SSH key value did not decode as base64." >&2 ;;
+      3) echo "WARNING: the SSH key value was empty after decoding." >&2 ;;
+      4) echo "WARNING: the SSH key value is not a valid private key." >&2 ;;
+      *) echo "WARNING: could not install the SSH key into '$NAME'." >&2 ;;
+    esac
+    echo "         Any key already in '$NAME' was left untouched." >&2
+    return 0
+  fi
+
+  local fp
+  fp="$(docker exec -u "$CONTAINER_USER" "$NAME" ssh-keygen -l -f /home/$CONTAINER_USER/.ssh/id_rsa 2>/dev/null || echo '?')"
+  echo "Installed remote-Docker SSH key into '$NAME': $fp"
+}
+
+# Warn loudly if the container has no usable key: `docker` inside it targets the
+# remote VM over SSH, and the failure you'd otherwise get is an opaque auth error
+# a long way from the cause.
+check_ssh_key() {
+  if docker exec -u "$CONTAINER_USER" "$NAME" test -s /home/$CONTAINER_USER/.ssh/id_rsa 2>/dev/null; then
+    return 0
+  fi
+  cat >&2 <<EOF
+
+WARNING: no SSH key in '$NAME'. Docker commands inside the container
+         (DOCKER_HOST=ssh://${REMOTE_DOCKER_USER}@${REMOTE_DOCKER_HOST}) will fail.
+         Export $(org_var DOCKER_SSH_KEY_OP_REF) with a 1Password reference
+         (see the README, "Remote Docker daemon"), or DOCKER_SSH_KEY with the key
+         material, then re-run 'claude-box-dotnet start'. Everything else works without it.
+EOF
+}
+
+# Mirror the HOST's git identity into the container. Commits are made inside the
+# container (pushes happen on the host), and `git commit` refuses to run without
+# a name and an email — a fresh container has neither. Note this is identity, not
+# credentials: it confers no ability to reach any git server.
+# Override with GIT_USER_NAME / GIT_USER_EMAIL. Otherwise we ask the host's git,
+# from inside the project directory, so a repo-local identity wins over the global
+# one exactly as it would on the host.
+resolve_git_identity() {
+  GIT_NAME="${GIT_USER_NAME:-$(git -C "$WORKSPACE" config --get user.name 2>/dev/null || true)}"
+  GIT_EMAIL="${GIT_USER_EMAIL:-$(git -C "$WORKSPACE" config --get user.email 2>/dev/null || true)}"
+}
+
+# Applied on every start, not just on create: the container's home directory is
+# not a named volume, so a recreated container comes up with no identity again.
+install_git_identity() {
+  if [ -z "${GIT_NAME:-}" ] && [ -z "${GIT_EMAIL:-}" ]; then
+    cat >&2 <<EOF
+WARNING: no git identity found on the host, so 'git commit' will fail inside
+         '$NAME'. Set user.name/user.email in your host git config, or export
+         GIT_USER_NAME and GIT_USER_EMAIL, then re-run 'claude-box-dotnet start'.
+EOF
+    return 0
+  fi
+  if [ -n "${GIT_NAME:-}" ]; then
+    docker exec -u "$CONTAINER_USER" "$NAME" git config --global user.name "$GIT_NAME" \
+      || echo "WARNING: could not set git user.name in '$NAME'." >&2
+  fi
+  if [ -n "${GIT_EMAIL:-}" ]; then
+    docker exec -u "$CONTAINER_USER" "$NAME" git config --global user.email "$GIT_EMAIL" \
+      || echo "WARNING: could not set git user.email in '$NAME'." >&2
+  fi
+  echo "Git identity in '$NAME': ${GIT_NAME:-<unset>} <${GIT_EMAIL:-unset}>"
+}
+
+# Show a connection string with its password masked. Users override the throwaway
+# default with real credentials, and the status report lands in terminals and logs.
+redact_conn() {
+  printf '%s' "$1" | sed -E 's/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Ww][Dd])=[^;]*/\1=***/g'
+}
+
+# Print the PROJECT_CODE_NAME the container was CREATED with, empty if it has
+# none. A container's environment is fixed at create time — `docker start` cannot
+# add a variable — so a container that predates this feature (or was started with a
+# different code name) keeps the old prompt until it is recreated. Reading it back
+# from the container makes that visible here instead of a mystery after attaching.
+# Read via inspect, not `docker exec printenv`, so it also works while stopped.
+container_code_name() {
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    | sed -n 's/^PROJECT_CODE_NAME=//p'
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_start() {
+  resolve_target "${1:-}"
+  resolve_token
+  resolve_ssh_key
+  resolve_git_identity
+
+  # Fixed host port if PORT is set, otherwise an auto-assigned (ephemeral) one so
+  # multiple projects can run simultaneously without colliding on :8080.
+  if [ -n "${PORT:-}" ]; then
+    PORT_ARG=(-p "${PORT}:8080")
+  else
+    PORT_ARG=(-p 8080)
+  fi
+
+  # This tool runs containers and never builds. A missing image is a hard error
+  # naming the builder, so the two responsibilities stay cleanly separated.
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "ERROR: image '$IMAGE' does not exist. Build it with: $BUILD_SCRIPT" >&2
+    exit 1
+  fi
+
+  # Only pass the token when we actually have one. An empty -e still CREATES the
+  # variable inside the container, and an empty CLAUDE_CODE_OAUTH_TOKEN is a
+  # different thing to Claude than an absent one.
+  TOKEN_ARG=()
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    TOKEN_ARG=(-e CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
+  fi
+
+  if docker container inspect "$NAME" >/dev/null 2>&1; then
+    # Guard against CLAUDE_ORG drift. The container name comes from the project
+    # PATH only, so the same directory started under a different org would
+    # silently reuse the previous org's credentials volume and baked-in token env
+    # — the exact confusion the namespacing exists to prevent. Containers created
+    # before this label existed report "<no value>", which we treat as "no org".
+    EXISTING_ORG="$(docker inspect -f '{{index .Config.Labels "claude-box.org"}}' "$NAME" 2>/dev/null || true)"
+    [ "$EXISTING_ORG" != "<no value>" ] || EXISTING_ORG=""
+    if [ "$EXISTING_ORG" != "$CLAUDE_ORG" ]; then
+      cat >&2 <<EOF
+ERROR: container '$NAME' was created with
+       CLAUDE_ORG='${EXISTING_ORG:-<none>}', but you are running with
+       CLAUDE_ORG='${CLAUDE_ORG:-<none>}'. Reusing it would mount the other org's
+       Claude credentials. Recreate it for this org:
+
+         claude-box-dotnet rm    "$WORKSPACE"
+         claude-box-dotnet start "$WORKSPACE"
+EOF
+      exit 1
+    fi
+    echo "Reusing existing container '$NAME' (starting it)..."
+    docker start "$NAME" >/dev/null
+  else
+    echo "Creating container '$NAME' for $WORKSPACE ..."
+    docker run -d \
+      --name "$NAME" \
+      --hostname "$NAME" \
+      --label "claude-box.org=${CLAUDE_ORG}" \
+      --add-host=host.docker.internal:host-gateway \
+      --cap-add=NET_ADMIN --cap-add=NET_RAW \
+      -v "$WORKSPACE":/workspace \
+      -v "$CONFIG_VOLUME":/home/$CONTAINER_USER/.claude \
+      -v "claude-dotnet-sessions-${HASH}":/home/$CONTAINER_USER/.claude/projects \
+      -v "claude-dotnet-bash-history-${HASH}":/commandhistory \
+      -v claude-nuget-cache:/home/$CONTAINER_USER/.nuget/packages \
+      -v claude-pre-commit-cache:/home/$CONTAINER_USER/.cache/pre-commit \
+      -e PRE_COMMIT_HOME=/home/$CONTAINER_USER/.cache/pre-commit \
+      -e ConnectionStrings__Default="$DB_CONNECTION_STRING" \
+      -e PROJECT_CODE_NAME="$PROJECT_CODE_NAME" \
+      "${TOKEN_ARG[@]}" \
+      -e REMOTE_DOCKER_USER="$REMOTE_DOCKER_USER" \
+      -e REMOTE_DOCKER_HOST="$REMOTE_DOCKER_HOST" \
+      -e DOCKER_HOST="ssh://${REMOTE_DOCKER_USER}@${REMOTE_DOCKER_HOST}" \
+      "${PORT_ARG[@]}" \
+      "$IMAGE" >/dev/null
+
+    # The per-project sessions volume is a FRESH named volume, so it mounts as
+    # root:root — but Claude runs as the container user and must write session
+    # transcripts there. Same for the NuGet and pre-commit caches. Fix ownership
+    # once, right after create, or history is silently lost and restore fails.
+    docker exec -u root "$NAME" chown "$CONTAINER_USER:$CONTAINER_USER" \
+      /home/$CONTAINER_USER/.claude/projects \
+      /home/$CONTAINER_USER/.nuget/packages \
+      /home/$CONTAINER_USER/.cache/pre-commit
+
+    # If the mounted project has a solution or project file, restore it now (into
+    # the NuGet cache volume and the image's ArtifactsPath, both OUTSIDE the mount —
+    # nothing leaks into your project). Honor existing lockfiles if present;
+    # otherwise create them. Never abort the start on failure.
+    if compgen -G "$WORKSPACE/*.sln" >/dev/null \
+       || compgen -G "$WORKSPACE/*.slnx" >/dev/null \
+       || compgen -G "$WORKSPACE/*.csproj" >/dev/null; then
+      echo "Found a solution/project file; running 'dotnet restore' inside the container..."
+      docker exec "$NAME" bash -lc \
+        'if find . -maxdepth 2 -name packages.lock.json | grep -q .; then dotnet restore --locked-mode; else dotnet restore; fi' \
+        || echo "  (dotnet restore failed — run it yourself after attaching)"
+    fi
+  fi
+
+  # Inject the key on EVERY start, not just on create: it lives in the container's
+  # writable layer, so a recreated container would otherwise come up keyless.
+  install_ssh_key
+  check_ssh_key
+  install_git_identity
+
+  # Report the actual host port mapped to container :8080.
+  MAPPED="$(docker port "$NAME" 8080 2>/dev/null | head -1 || true)"
+
+  ACTUAL_CODE_NAME="$(container_code_name)"
+  if [ -n "$ACTUAL_CODE_NAME" ]; then
+    CODE_NAME_REPORT="$ACTUAL_CODE_NAME"
+  else
+    CODE_NAME_REPORT="<none> (prompt shows '$CONTAINER_USER'; 'claude-box-dotnet rm' + 'start' applies '$PROJECT_CODE_NAME')"
+  fi
+
+  cat <<EOF
+
+Container '$NAME' is running.
+  workspace : $WORKSPACE  ->  /workspace
+  code name : $CODE_NAME_REPORT  (shell prompt)
+  database  : $(redact_conn "$DB_CONNECTION_STRING")
+  port      : ${MAPPED:-<none>}  ->  container :8080
+  org       : ${CLAUDE_ORG:-<none>}  (Claude credentials volume: $CONFIG_VOLUME)
+
+Next:
+  1. VS Code -> "Dev Containers: Attach to Running Container" -> $NAME
+  2. Start a Claude conversation in the extension.
+
+Stop when done:  claude-box-dotnet stop $WORKSPACE
+EOF
+}
+
+cmd_stop() {
+  resolve_target "${1:-}"
+  if ! docker container inspect "$NAME" >/dev/null 2>&1; then
+    echo "No container for this project ($NAME)." >&2
+    exit 1
+  fi
+  echo "Stopping '$NAME' ..."
+  docker stop "$NAME" >/dev/null
+  echo "Stopped."
+}
+
+cmd_rm() {
+  resolve_target "${1:-}"
+  if ! docker container inspect "$NAME" >/dev/null 2>&1; then
+    echo "No container for this project ($NAME)." >&2
+    exit 1
+  fi
+  echo "Removing '$NAME' (stopping if running) ..."
+  docker rm -f "$NAME" >/dev/null
+  echo "Removed. Next 'claude-box-dotnet start' will create a fresh one (picking up any rebuilt image)."
+}
+
+cmd_shell() {
+  resolve_target "${1:-}"
+  if ! docker container inspect "$NAME" >/dev/null 2>&1; then
+    echo "No container for this project ($NAME). Start it with: claude-box-dotnet start $WORKSPACE" >&2
+    exit 1
+  fi
+  # Start it if it exists but isn't running, then open an interactive login shell.
+  if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != "true" ]; then
+    echo "Container '$NAME' is stopped; starting it ..."
+    docker start "$NAME" >/dev/null
+  fi
+  exec docker exec -it -w /workspace "$NAME" bash -l
+}
+
+cmd_info() {
+  resolve_target "${1:-}"
+  if ! docker container inspect "$NAME" >/dev/null 2>&1; then
+    cat <<EOF
+Container   : $NAME
+Status      : absent (not created)
+Workspace   : $WORKSPACE
+Start it with:  claude-box-dotnet start $WORKSPACE
+EOF
+    return 0
+  fi
+
+  STATUS="$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo unknown)"
+  STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$NAME" 2>/dev/null || echo '')"
+  IMG="$(docker inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null || echo '')"
+  MAPPED="$(docker port "$NAME" 8080 2>/dev/null | head -1 || true)"
+  # The org the container was CREATED with, which is what its mounted credentials
+  # actually belong to — not necessarily the CLAUDE_ORG in your current shell.
+  CONTAINER_ORG="$(docker inspect -f '{{index .Config.Labels "claude-box.org"}}' "$NAME" 2>/dev/null || true)"
+  [ "$CONTAINER_ORG" != "<no value>" ] || CONTAINER_ORG=""
+  CONTAINER_CODE_NAME="$(container_code_name)"
+
+  cat <<EOF
+Container   : $NAME
+Status      : $STATUS (since $STARTED)
+Image       : $IMG
+Workspace   : $WORKSPACE  ->  /workspace
+Code name   : ${CONTAINER_CODE_NAME:-<none>} (created with; shown in the shell prompt)
+Port        : ${MAPPED:-<none>}  ->  container :8080
+Org         : ${CONTAINER_ORG:-<none>} (created with)
+Shell org   : ${CLAUDE_ORG:-<none>} (CLAUDE_ORG in this shell)
+EOF
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+[ $# -ge 1 ] || usage 2
+CMD="$1"; shift || true
+case "$CMD" in
+  start)   cmd_start   "${1:-}" ;;
+  stop)    cmd_stop    "${1:-}" ;;
+  rm)      cmd_rm      "${1:-}" ;;
+  shell)   cmd_shell   "${1:-}" ;;
+  info)    cmd_info    "${1:-}" ;;
+  -h|--help|help) usage 0 ;;
+  *) echo "Unknown command: $CMD" >&2; usage 2 ;;
+esac

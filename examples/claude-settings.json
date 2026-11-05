@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "statusMessage": "Formatting with dotnet format",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.cs) [ -f \"$f\" ] && dotnet format whitespace --folder --include \"$f\" >/dev/null 2>&1;; esac; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}

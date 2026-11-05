@@ -1,0 +1,62 @@
+# EXAMPLE *project* pre-commit config — copy this into YOUR project's root as
+# `.pre-commit-config.yaml`. It is NOT used by the dev container image itself;
+# it configures hooks for the project you build inside the container.
+#
+#   pre-commit install        # once per clone: writes .git/hooks/pre-commit
+#   pre-commit run --all-files  # check everything without committing
+#
+# `pre-commit` is installed globally in the image (via pipx), so it is on PATH
+# without adding it to your project's dependencies. Its hook environments are
+# cached in a named Docker volume via PRE_COMMIT_HOME, so they survive container
+# recreation instead of being re-downloaded after every image rebuild.
+#
+# WHERE HOOKS RUN: you commit inside the container, so these run in the sandbox.
+# Note that `.git/hooks/` lives in the bind mount and is therefore visible on the
+# host — a `pre-push` hook would execute on YOUR machine when you push. This file
+# defines no pre-push hook; if one ever appears in a diff, look closely.
+
+repos:
+  # dotnet format, run from the image's SDK (`language: system`), so there is
+  # nothing to download and no hook environment to build. The trade-off is that it
+  # is container-only: CI and teammates need the .NET SDK on PATH too.
+  #
+  # `--verify-no-changes` makes the hook FAIL WITH A DIAGNOSTIC instead of
+  # rewriting files, which avoids the "files were modified by this hook"
+  # double-commit cycle (see A NOTE ON AGENTS). Whitespace is already kept clean
+  # by the PostToolUse hook in examples/claude-settings.json, so a failure here is
+  # rare; fix it with `dotnet format` and commit again. Style + analyzers are a
+  # solution-level operation (slow), which is why they live here and not there.
+  #
+  # `dotnet format` needs a solution or project to find, so this expects a .sln/.slnx
+  # (or a single .csproj) at the repo root; otherwise append its path to `entry`.
+  - repo: local
+    hooks:
+      - id: dotnet-format
+        name: dotnet format (verify)
+        entry: dotnet format --verify-no-changes --severity warn
+        language: system
+        types_or: [c#]
+        pass_filenames: false
+
+  # Cheap, language-agnostic guards worth having everywhere.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-xml            # csproj / props / slnx
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      # Refuses to commit a private key. Cheap insurance given this container
+      # deliberately holds no git credentials.
+      - id: detect-private-key
+
+# A NOTE ON AGENTS
+# Hooks that REWRITE files and then fail the commit make the first `git commit`
+# after an unformatted edit fail with "files were modified by this hook"; Claude
+# re-stages and commits again and the second attempt succeeds. Several hooks above
+# (trailing-whitespace, end-of-file-fixer) behave this way and settle in one extra
+# cycle. The dotnet-format hook deliberately does NOT rewrite: it only verifies, so
+# it fails with a diagnostic instead. To avoid the cycle entirely, let the
+# PostToolUse hook in examples/claude-settings.json format as Claude writes.

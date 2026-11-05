@@ -1,0 +1,522 @@
+# Claude Code Dev Container — .NET 10 / ASP.NET Core
+
+A customizable, isolated dev container for running **Claude Code** against a
+.NET 10 + ASP.NET Core + PostgreSQL project. Claude runs *inside* the container, so it
+can operate unrestricted (`--dangerously-skip-permissions`) without touching your
+host machine. Your repo is bind-mounted, so edits appear live in your editor.
+
+## The idea
+
+The **product here is the container template itself** — a reusable, customizable
+dev container that lets you run Claude Code fully unrestricted inside an isolated
+Docker container, driven from the VS Code Claude Code extension.
+
+Running Claude unrestricted on your host is risky, and Claude refuses the
+unrestricted flag when launched as root. This gives Claude a **non-root sandbox**
+where it can install tools and work freely without touching the host, while your
+repo stays bind-mounted and live-editable. The **custom image is the point**: you
+own the Dockerfile, so you can add any system tools, language runtimes, or CLIs a
+project needs.
+
+The .NET 10 (LTS) + ASP.NET Core + PostgreSQL stack is the *worked example* that ships with
+it — a clean starting point — not the end goal.
+
+### Goals
+
+- Run Claude Code unrestricted, safely isolated from the host, connectable from
+  the VS Code extension.
+- Make the image **easy to customize** — adding tools should be a clean,
+  documented one-liner in the Dockerfile (see [Customizing](#customizing)).
+- Provide a solid .NET 10 + ASP.NET Core + PostgreSQL worked example so the container
+  is useful out of the box.
+
+## What's in here
+
+```
+.
+├── .devcontainer/
+│   ├── Dockerfile               # the generic image: .NET 10 SDK + tools + Claude Code CLI
+│   ├── devcontainer.json        # optional: per-project "Reopen in Container" flow (see below)
+│   ├── ssh_config               # SSH client defaults for reaching the remote Docker daemon
+│   ├── managed-settings.json    # container-only Claude policy (bypassPermissions)
+│   ├── local_claude.json        # pre-seeds Claude onboarding/trust so the TUI starts at the prompt
+│   ├── inputrc                  # readline history-search on Up/Down
+│   └── bash_prompt.sh           # shows the project code name in the shell prompt
+├── build-image                  # MAINTAINER: build the image from .devcontainer/
+├── claude-box-dotnet               # USERS: run/manage a container per project, then attach
+├── examples/
+│   ├── compose.yaml             # sample PROJECT compose (app + Postgres) to copy into your project
+│   ├── .pre-commit-config.yaml  # sample PROJECT pre-commit hooks (dotnet format + guards)
+│   └── claude-settings.json     # sample PROJECT .claude/settings.json (format-on-edit hook)
+├── CLAUDE.md                    # project context Claude reads automatically
+├── HOWTO.md                     # step-by-step usage guide
+├── .gitignore
+└── README.md
+```
+
+No secrets live in this tree. The SSH key and the Claude token are resolved from
+1Password at start time — see [Remote Docker daemon](#remote-docker-daemon).
+
+The **image is generic** — it bundles the .NET 10 SDK and the Claude Code
+CLI but no project files. You mount whatever project directory you want at
+`/workspace`; that directory holds the solution, `.csproj` files, app code, etc.
+
+## Prerequisites
+
+- Docker (Docker Desktop on macOS/Windows, or Docker Engine on Linux)
+- VS Code with the **Dev Containers** extension
+- **C# Dev Kit licensing:** the image asks VS Code to install
+  `ms-dotnettools.csdevkit`, which has its own license terms (free for individuals,
+  open source and small teams; otherwise it needs a Visual Studio subscription). If
+  that doesn't suit you, drop it and keep only the open-source C# extension — see
+  [Customizing](#customizing).
+- A Claude subscription or Anthropic API access (you sign in on first run)
+- A reachable PostgreSQL instance (external — not managed by this container)
+- **Only if you want Docker to work *inside* the container:** a remote Docker
+  host reachable over SSH, plus the `op` CLI to fetch its key — see
+  [Remote Docker daemon](#remote-docker-daemon). Everything else works without it.
+
+## Quick start
+
+The primary flow: build the generic image once, then run it against any project
+directory and attach VS Code to the running container.
+
+1. Clone this repo (it holds the `Dockerfile`, `build-image`, and `claude-box-dotnet`).
+2. Build the image once (a few minutes; cached and reused after that):
+
+   ```bash
+   ./build-image
+   ```
+
+3. Run the helper, pointing it at the project you want to work on:
+
+   ```bash
+   ./claude-box-dotnet start /path/to/your/project      # PROJECT_DIR defaults to the current directory
+   ```
+
+   This starts a detached container with your project bind-mounted at
+   `/workspace`. If the project has a solution or project file, `dotnet restore`
+   runs automatically. `claude-box-dotnet` never builds — it errors if the image is missing.
+4. In VS Code: **Cmd/Ctrl+Shift+P → Dev Containers: Attach to Running Container**,
+   pick `claude-dotnet-<your-project>-<hash>` (the hash is derived from the project's
+   absolute path, so same-named folders stay distinct).
+5. In the container's integrated terminal, authenticate once, then run unrestricted:
+
+   ```bash
+   claude --dangerously-skip-permissions
+   ```
+
+   > First login in a container shows a **code** instead of a browser redirect:
+   > open the printed URL on your host, then paste the code back into the terminal.
+
+Switch projects anytime by running `./claude-box-dotnet start` against a different
+directory — each gets its own container, and they share one Claude login (per org
+when `CLAUDE_ORG` is set; see [Namespacing with `CLAUDE_ORG`](#namespacing-with-claude_org)).
+
+The helper takes a subcommand and an optional project directory (default: the
+current one):
+
+| Command | What it does |
+| --- | --- |
+| `claude-box-dotnet start [DIR]` | Create (first time) or start `DIR`'s container |
+| `claude-box-dotnet stop [DIR]` | Stop the running container |
+| `claude-box-dotnet rm [DIR]` | Stop and remove it, so the next `start` builds fresh |
+| `claude-box-dotnet shell [DIR]` | Open an interactive shell inside it |
+| `claude-box-dotnet info [DIR]` | Show status, image, workspace, and mapped port |
+
+## Upgrading Claude Code
+
+The image pins whatever Claude Code version was current when it was built, and
+`DISABLE_AUTOUPDATER=1` keeps it there on purpose — no version drift in the middle
+of a session. Upgrading is therefore an explicit act:
+
+Building the image is a **separate script**, `build-image`. `claude-box-dotnet` manages
+containers and never rebuilds; producing an image is a maintainer task and stays
+out of the day-to-day tool.
+
+```bash
+./build-image              # newest Claude, cached layers — seconds
+./build-image --full       # every layer, fresh base image — minutes
+./build-image -t mytag     # build under a different tag
+```
+
+It passes a changing `CLAUDE_INSTALL_BUST` build arg, which invalidates the Docker
+cache from the Claude install layer down while the apt/tools/ssh layers above it stay
+cached, then prints the Claude version that actually landed.
+
+A **running container keeps using the image it was created from**, so building
+alone changes nothing. Recreate each container you want moved onto the new image:
+
+```bash
+claude-box-dotnet rm    ~/Projects/my-app
+claude-box-dotnet start ~/Projects/my-app
+```
+
+That's safe — your project files are on the host, and Claude's auth, session, and
+shell history live in named volumes that survive. Containers are independent, so
+the ones you don't recreate stay on the previous image.
+
+### Without the helpers
+
+`claude-box-dotnet` is a convenience, not a requirement. The equivalent by hand:
+
+```bash
+docker build -t claude-dotnet-devcontainer .devcontainer
+
+docker run -d --name claude-dotnet \
+  --add-host=host.docker.internal:host-gateway \
+  --cap-add=NET_ADMIN --cap-add=NET_RAW \
+  -v "$PWD":/workspace \
+  -v claude-code-config:/home/vscode/.claude \
+  -v claude-dotnet-sessions-mine:/home/vscode/.claude/projects \
+  -v claude-dotnet-bash-history-mine:/commandhistory \
+  -v claude-nuget-cache:/home/vscode/.nuget/packages \
+  -v claude-pre-commit-cache:/home/vscode/.cache/pre-commit \
+  -e PRE_COMMIT_HOME=/home/vscode/.cache/pre-commit \
+  -e ConnectionStrings__Default="Host=host.docker.internal;Port=5432;Database=app;Username=postgres;Password=postgres" \
+  -e PROJECT_CODE_NAME="$(basename "$PWD")" \
+  -e DOCKER_HOST="ssh://dockerizer@192.168.122.10" \
+  -p 8080 claude-dotnet-devcontainer
+
+# fresh volumes mount as root; Claude runs as vscode and must write there
+docker exec -u root claude-dotnet chown vscode:vscode \
+  /home/vscode/.claude/projects /home/vscode/.nuget/packages /home/vscode/.cache/pre-commit
+```
+
+Two things `claude-box-dotnet` does that this doesn't: it resolves the Claude token and
+the remote-Docker SSH key from 1Password and injects them, so here you would log
+in interactively and place `~/.ssh/id_rsa` yourself (mode 600) before `docker`
+inside the container can reach the remote daemon.
+
+## How it works
+
+- **Generic image, mounted project.** The image bundles the .NET 10 SDK and the
+  Claude Code CLI but **no project files**. Your project dir is bind-mounted at
+  `/workspace` at run time, so one image serves many projects and edits appear
+  live on the host.
+- **Claude Code is baked into the image.** Installed via the official native
+  installer (no Node.js) as the `vscode` user, so it lands on `PATH` at
+  `~/.local/bin`. (The Dev Containers *feature* only runs under the Dev Containers
+  extension, so a plain `docker run` image can't rely on it.)
+- **Non-root by design.** The container runs as the `vscode` user — required:
+  Claude Code rejects `--dangerously-skip-permissions` when launched as root.
+- **Tools install at build time.** The Dockerfile's `RUN` steps run as root, so
+  `apt-get`/`dotnet tool` installs have full privileges; at runtime `vscode` still has
+  passwordless `sudo` if needed.
+- **NuGet cache and build output live outside the mount.** Two things in a .NET
+  project can leak between host and container, and the image handles both:
+  - *The package cache.* `NUGET_PACKAGES` points at `~/.nuget/packages`, backed by
+    the shared named volume `claude-nuget-cache` (it is content-addressed, so
+    sharing it across projects is safe). It survives `rm` + `start`, so restores
+    after recreating a container are served from the volume, not the network.
+  - *`bin/` and `obj/`.* A host-built `obj/project.assets.json` records absolute
+    **host** paths and the host's package folder, which breaks restore/build in the
+    container (and vice versa). The image sets `ArtifactsPath=/home/vscode/.artifacts`;
+    MSBuild reads it from the environment, so **both `bin/` and `obj/`** (including
+    `project.assets.json`) go to the container's own filesystem, with no
+    `Directory.Build.props` needed. This was checked against a plain
+    `dotnet new webapi` + xUnit solution. The honest trade-off: build output is
+    ephemeral — it is rebuilt after `claude-box-dotnet rm` — and tools that expect
+    `bin/` inside the project (IDE debuggers launched on the host, `dotnet publish`
+    output you want to pick up on the host) won't find it there; use
+    `dotnet publish -o <dir>` for that. If you'd rather have in-workspace output,
+    delete the `ArtifactsPath` line from the Dockerfile's `ENV` block (`bin/` and
+    `obj/` are gitignored) and run `dotnet clean` / delete `bin obj` whenever you
+    switch between host and container builds.
+  `claude-box-dotnet` runs `dotnet restore` for you when the mounted project has a
+  solution or project file (`--locked-mode` if a `packages.lock.json` exists).
+- **The project stays independent.** The container is only a development
+  convenience — it imposes nothing on your project. Nothing in the project's files
+  references the container (`ArtifactsPath` and `NUGET_PACKAGES` are set *only* by
+  the image's environment). So the same project builds and runs fine **outside**
+  the container with plain `dotnet build` / `dotnet run` — on your host, in CI, or
+  on a teammate's machine. The container is never a requirement.
+- **Claude state persists.** Named volumes hold `~/.claude` (auth, settings) and
+  shell history across container recreations, so you don't re-login every time.
+- **The prompt names the project.** Every container runs as `vscode` with the
+  project at `/workspace`, so the stock prompt looks identical in all of them.
+  `claude-box-dotnet start` injects `PROJECT_CODE_NAME` (the project directory's basename)
+  and the container's shell puts it where the username was —
+  `myproject ➜ /workspace (main) $`. Unset, you get the base image's
+  `vscode ➜ …` unchanged, which is what the "Reopen in Container" flow shows.
+  Because a container's environment is fixed at creation, an existing container
+  needs `claude-box-dotnet rm` + `start` to pick up a new code name; `claude-box-dotnet info`
+  prints the one it actually has.
+- **Docker inside the container targets a remote daemon.** There's no daemon in
+  here — `docker` talks over SSH to a separate host, so containers Claude builds
+  never land on your laptop. See [Remote Docker daemon](#remote-docker-daemon).
+- **The image holds no secrets.** The SSH key and Claude token are resolved from
+  1Password on the host at start time and injected into the running container.
+- **VS Code copies your host `~/.gitconfig` in on attach.** That's the extension's
+  own behaviour, not `claude-box-dotnet`. It brings your aliases and pager settings
+  along, so **`diff-so-fancy` is installed in the image** — otherwise a
+  `core.pager = diff-so-fancy | less …` on your host would point at a missing
+  binary in here. It's a self-contained Perl script, so it needs no Node despite
+  being distributed via npm, and it's refreshed to the current stable release on
+  every `build-image`.
+- **Your git identity is mirrored in, but no git credentials are.** `claude-box-dotnet`
+  copies your host `user.name`/`user.email` so commits can be made *inside* the
+  container; it never puts a key or token for any git host there. Commit in the
+  container, review, and push from the host. Override with `GIT_USER_NAME` /
+  `GIT_USER_EMAIL`.
+
+## Alternative: per-project Dev Container
+
+If you'd rather use the standard **Dev Containers: Reopen in Container** flow for
+a single project, copy `.devcontainer/`, `CLAUDE.md`, and `.gitignore` into that
+project root and reopen it in the container. `devcontainer.json` builds the same
+image, installs the Claude Code and C# extensions, and runs `dotnet restore` on create
+(when a solution or project file exists). Use this
+when you want the config versioned alongside one specific project rather than a
+shared, mountable image.
+
+> **Docker inside the container does not work in this flow.** The remote-daemon
+> SSH key is injected at run time by `claude-box-dotnet start`, and Reopen-in-Container
+> has no equivalent hook, so `DOCKER_HOST` is left unset rather than set and
+> broken. Everything else — .NET, `dotnet format`, psql, Claude Code — works normally.
+> Use `claude-box-dotnet` if you need Claude to build or run containers.
+
+## Remote Docker daemon
+
+The container runs **no Docker daemon**. It ships only the Docker CLI and the
+Compose plugin, with `DOCKER_HOST` pointed at a daemon on a separate machine over
+SSH. So when Claude runs `docker build` or `docker compose up` inside the
+container, those containers are created **on that remote host**, not on your
+laptop.
+
+This is deliberate, and it's what keeps the isolation promise intact. The obvious
+alternative — bind-mounting your host's `/var/run/docker.sock` — would hand
+anything inside the container root-equivalent access to your host filesystem
+(`docker run -v /:/host …`), which is exactly what this project exists to prevent.
+A throwaway remote VM absorbs that risk instead.
+
+Configure it with these host environment variables (all optional):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `REMOTE_DOCKER_USER` | `dockerizer` | SSH user on the Docker host |
+| `REMOTE_DOCKER_HOST` | `192.168.122.10` | Address of the Docker host |
+| `DOCKER_SSH_KEY_OP_REF` | *(unset)* | 1Password reference for the SSH **private key**, e.g. `op://Private/dockerizer-ssh/private key` |
+| `DOCKER_SSH_KEY` | *(unset)* | The key material directly, bypassing 1Password |
+| `OP_SERVICE_ACCOUNT_TOKEN` | *(unset)* | 1Password service-account token, so `op` works non-interactively |
+
+### Namespacing with `CLAUDE_ORG`
+
+Nothing here is tied to a particular company. If you juggle more than one
+organization in the same shell and don't want their references colliding, set
+`CLAUDE_ORG` and every secret variable gains that prefix:
+
+```bash
+export CLAUDE_ORG=acme
+export ACME_CLAUDE_TOKEN_OP_REF="op://Acme/Claude Code/credential"
+export ACME_DOCKER_SSH_KEY_OP_REF="op://Acme/docker-vm/private key"
+export ACME_OP_SERVICE_ACCOUNT_TOKEN="ops_…"
+```
+
+Each variable is looked up **prefixed first, then plain** — so with `CLAUDE_ORG` unset
+you just use `CLAUDE_TOKEN_OP_REF`, `DOCKER_SSH_KEY_OP_REF`, and
+`OP_SERVICE_ACCOUNT_TOKEN`, and with `CLAUDE_ORG` set you can still leave shared values
+unprefixed and only override the ones that differ. `CLAUDE_ORG` is upper-cased for you,
+so `CLAUDE_ORG=acme` and `CLAUDE_ORG=ACME` behave identically.
+
+For the service-account token the prefixed form may also be spelled
+`<CLAUDE_ORG>_1P_TOKEN`, and unprefixed it falls back to `OP_SERVICE_ACCOUNT_TOKEN` —
+1Password's own standard variable, so if you already export that for the `op` CLI
+this script needs no extra configuration.
+
+#### Keeping Claude logins apart
+
+Picking the right *reference* isn't enough on its own, because Claude persists its
+login in `~/.claude`, which is backed by a named volume. So `CLAUDE_ORG` namespaces that
+volume too: `claude-code-config-acme` instead of the shared `claude-code-config`.
+Without this, an org-scoped token would still be written into — and later read
+back out of — one credentials store shared by every container on the machine.
+
+Two further guards:
+
+- **Token precedence is explicit.** An `<CLAUDE_ORG>`-prefixed reference outranks a
+  `CLAUDE_CODE_OAUTH_TOKEN` that merely happens to be exported in your shell,
+  because naming an org-scoped reference is a deliberate statement about which
+  account this project uses. `claude-box-dotnet` prints which source it used, and says so
+  when both are present. With no `CLAUDE_ORG` set, an exported token still wins.
+- **Org drift is refused.** A container's name derives from the project path
+  alone, so starting the same directory under a different `CLAUDE_ORG` would otherwise
+  silently reuse the previous org's credentials. Containers are labelled with the
+  org that created them, and `claude-box-dotnet start` aborts on a mismatch, telling you
+  to `rm` and recreate. `claude-box-dotnet info` shows both the container's org and your
+  shell's.
+
+Containers created before this labelling existed have no org recorded; they keep
+working as long as `CLAUDE_ORG` is unset, which matches the credentials they already have.
+
+### How the key is handled
+
+The private key is **never committed to this repo and never baked into the
+image**. `claude-box-dotnet start` reads it from 1Password on your host (via
+`DOCKER_SSH_KEY_OP_REF`, or its `CLAUDE_ORG`-prefixed form) and writes it
+into the *running* container over stdin — not via `-e` (which would expose it in
+`docker inspect`) and not as an argument (visible in `ps`). It lands at
+`~/.ssh/id_rsa` with mode 600, and is re-injected on every `start` so a recreated
+container is never left keyless.
+
+The 1Password item holds the private key **base64-encoded**; `claude-box-dotnet` decodes
+it inside the container as it writes. A raw PEM key is detected and passed through
+unchanged, so `DOCKER_SSH_KEY` can be either form. After writing, the key is
+validated with `ssh-keygen -l` and the fingerprint printed — a mis-encoded secret
+fails immediately and visibly rather than surfacing later as an opaque SSH
+authentication error.
+
+The practical consequences: the image contains no secret, so it can be pulled,
+saved, or shared safely; a fresh clone builds with no extra files; and rotating
+the key means updating one 1Password item, not rebuilding anything.
+
+If no key is available, `claude-box-dotnet` warns and starts anyway. Everything except
+Docker-inside-the-container works fine without it.
+
+### Provisioning a new key
+
+A keypair has **two halves in two places**: the private half in 1Password, and the
+public half in the remote host's `authorized_keys`. `claude-box-dotnet` handles the first
+and cannot do the second — installing a public key requires access to the host you
+don't have yet. That step is one-time, server-side, and manual.
+
+1. **Generate a keypair** on your host, into a temporary location:
+
+   ```bash
+   ssh-keygen -t ed25519 -C "claude-box-dotnet docker vm" -f /tmp/newkey -N ""
+   ```
+
+2. **Install the public half** on the Docker host, as the user `claude-box-dotnet`
+   connects with (`REMOTE_DOCKER_USER`, default `dockerizer`):
+
+   ```bash
+   ssh-copy-id -i /tmp/newkey.pub dockerizer@192.168.122.10
+   ```
+
+   No `ssh-copy-id`? Append `/tmp/newkey.pub` to `~dockerizer/.ssh/authorized_keys`
+   on that host by hand. This needs an existing way in — the current key, console
+   access, or your cloud provider's key injection. **Verify it works before
+   retiring the old key**, or you can lock yourself out:
+
+   ```bash
+   ssh -i /tmp/newkey dockerizer@192.168.122.10 true && echo OK
+   ```
+
+3. **Store the private half in 1Password, base64-encoded**, in the item that
+   `DOCKER_SSH_KEY_OP_REF` points at:
+
+   ```bash
+   base64 -w0 < /tmp/newkey        # Linux
+   base64 < /tmp/newkey | tr -d '\n'   # macOS (no -w flag)
+   ```
+
+   Paste the single-line output into the item's field.
+
+4. **Shred the local copies** — they've served their purpose:
+
+   ```bash
+   shred -u /tmp/newkey /tmp/newkey.pub    # or: rm -f
+   ```
+
+5. **Roll it out.** The key is injected on every start, so recreating each
+   container picks up the new one:
+
+   ```bash
+   claude-box-dotnet rm    ~/Projects/some-app
+   claude-box-dotnet start ~/Projects/some-app
+   ```
+
+   `start` prints the fingerprint it installed, so you can confirm the new key
+   landed. Once every container is on it, remove the old public key from the
+   host's `authorized_keys`.
+
+Rotating an existing key is the same process against the same 1Password item —
+nothing in this repo or the image needs to change.
+
+## Connecting to your database
+
+The container only needs the `psql` client (included) and network reachability.
+
+- **DB on your laptop:** `host.docker.internal` resolves to the host (the
+  `--add-host` runArg enables this on Linux). The default connection string already
+  points there.
+- **Remote/hosted DB:** set `DB_CONNECTION_STRING` when starting the container (or
+  edit `ConnectionStrings__Default` in `devcontainer.json`). If you enable the
+  firewall, add that host to its allowlist.
+
+The string is injected as `ConnectionStrings__Default` — the ASP.NET Core
+configuration convention (`__` stands for the `:` section separator), in Npgsql's
+key/value format. Npgsql does not accept `postgresql://` URIs in a plain
+connection string. In your app:
+
+```csharp
+var cs = builder.Configuration.GetConnectionString("Default");
+builder.Services.AddNpgsqlDataSource(cs!);   // Npgsql.DependencyInjection
+```
+
+Test it with `psql` (it needs a libpq-style string, not the Npgsql one):
+`psql "host=host.docker.internal port=5432 dbname=app user=postgres" -c '\l'`
+
+## Customizing
+
+- **Add system tools:** add an `apt-get install` line to the Dockerfile.
+- **Add .NET tools globally:** add a `RUN dotnet tool install --global <pkg>` line
+  (they land in `~/.dotnet/tools`, already on `PATH`). `dotnet format` is built into
+  the SDK, so it needs no install.
+- **Add VS Code extensions:** append to `customizations.vscode.extensions` (both in
+  the Dockerfile's `devcontainer.metadata` label and in `devcontainer.json`).
+- **Change the .NET version:** change the base image tag in the Dockerfile (e.g.
+  `mcr.microsoft.com/devcontainers/dotnet:10.0`) — and the `dotnet --version` check
+  right below it, which fails the build if the major isn't 10. In your project, pin
+  the SDK with a `global.json` so host, container and CI agree.
+- **Dev Kit vs plain C#:** the image installs `ms-dotnettools.csdevkit` (solution
+  explorer, test explorer) alongside `ms-dotnettools.csharp`. To avoid the Dev Kit
+  license terms, remove `ms-dotnettools.csdevkit` (and the `dotnet.defaultSolution`
+  setting) from both lists; you keep the open-source language service.
+- **NativeAOT publishing:** uncomment the `clang zlib1g-dev` line in the Dockerfile.
+
+After any change run `./build-image`, then `claude-box-dotnet rm` + `claude-box-dotnet start`
+for each container that should pick it up. (In the Reopen-in-Container flow, use
+**Dev Containers: Rebuild Container** instead.)
+
+## Security notes — read before using `--dangerously-skip-permissions`
+
+The container protects your **host**, but it is not a vault:
+
+- Claude can modify **any file in the mounted workspace**, including `.env`.
+- Git credentials inside the container may allow **pushing to your repos**.
+- With the flag set, a malicious repo could **exfiltrate anything reachable
+  inside the container**, including Claude's own stored credentials.
+- `managed-settings.json` sets `allowManagedPermissionRulesOnly`, which makes
+  Claude **ignore every user and project permission rule** — including a project
+  `deny`, which nothing else can override. That is the point of the file, but it
+  means per-project rules give you no protection in here.
+- The **remote Docker SSH key** is injected into the running container, so
+  anything inside it can reach that daemon and is effectively root **on the remote
+  host**. That host should be disposable, not something you care about.
+- **VS Code's attach adds a git credential path that `claude-box-dotnet` does not.**
+  Along with copying your `~/.gitconfig`, the Dev Containers extension installs a
+  credential-helper that proxies requests back to the host. If you have HTTPS
+  credentials stored there, an attached container can obtain them and push to your
+  repositories. It returns nothing if you only use SSH remotes, and the
+  `IdentitiesOnly` setting in `ssh_config` stops a forwarded SSH agent being used
+  for git. If you want no path to your git host at all, turn off the gitconfig
+  copy and credential sharing in the Dev Containers extension settings.
+
+Therefore:
+
+- Only run trusted code this way.
+- Don't mount host secrets (`~/.ssh`, cloud credential files) into the container.
+- Keep the remote Docker host a throwaway. Don't point it at a machine that
+  matters, and never at your own Docker socket.
+- For unattended runs, add the egress firewall (see below) so a bypassed session
+  can only reach domains you've allowed.
+
+## Optional: egress firewall
+
+For hands-off / unattended sessions, add a default-deny firewall. Copy
+`init-firewall.sh` from the official reference container
+(`anthropics/claude-code/.devcontainer/init-firewall.sh`) into `.devcontainer/`,
+keep the `NET_ADMIN`/`NET_RAW` caps already set in `runArgs`, and uncomment the
+`postStartCommand` in `devcontainer.json`. Add your DB host, `api.nuget.org` (NuGet also uses other `*.nuget.org` hosts), and
+git host to its allowlist.

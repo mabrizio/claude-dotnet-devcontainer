@@ -1,0 +1,13 @@
+# SSH client config baked into the container (copied to ~/.ssh/config).
+#
+# Host-agnostic defaults for reaching the remote Docker VM over SSH:
+#   - default to the 'dockerizer' user
+#   - ALWAYS use the baked key; IdentitiesOnly forces it and ignores agent/other keys
+#   - auto-accept a host key on FIRST contact (still refuses if a known key CHANGES)
+# so `ssh` and docker-over-SSH (DOCKER_HOST=ssh://...) never hang on a prompt.
+Host *
+    User dockerizer
+    IdentityFile ~/.ssh/id_rsa
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+    UserKnownHostsFile ~/.ssh/known_hosts

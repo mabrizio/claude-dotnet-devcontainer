@@ -1,0 +1,81 @@
+// ALTERNATIVE FLOW — the "Dev Containers: Reopen in Container" path, for when you
+// want one project to own its config instead of the shared claude-box-dotnet workflow.
+//
+// LIMITATION: Docker inside the container will NOT work here. The image ships the
+// Docker CLI pointed at a remote daemon over SSH, but the private key is injected
+// at run time by `claude-box-dotnet start`, and this flow has no equivalent hook. So
+// DOCKER_HOST is deliberately left unset — see the README's "Remote Docker
+// daemon". Use claude-box-dotnet if you need Claude to build or run containers.
+{
+  "name": "claude-dotnet-devcontainer",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // No claude-code feature: the Dockerfile already installs the CLI via the
+  // official native installer, and the extension is listed under customizations
+  // below. Adding the feature would install a second copy of the CLI.
+
+  // MUST be a non-root user for --dangerously-skip-permissions to work.
+  // VS Code remaps this user's UID to match your host UID (updateRemoteUserUID,
+  // on by default), so bind-mounted files stay mutually editable.
+  "remoteUser": "vscode",
+
+  // --add-host maps host.docker.internal on Linux. The NET_ADMIN/NET_RAW caps
+  // are only needed for the optional egress firewall (init-firewall.sh);
+  // drop them if you rely on your own network controls.
+  "runArgs": [
+    "--add-host=host.docker.internal:host-gateway",
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW"
+  ],
+
+  // NUGET_PACKAGES, ASPNETCORE_URLS, ArtifactsPath and DISABLE_AUTOUPDATER are
+  // already set by the image's ENV, so they are not repeated here.
+  "containerEnv": {
+    // Connection string to your EXTERNAL postgres. host.docker.internal points
+    // at a DB running on your laptop; swap in a real host for a remote service.
+    // ASP.NET Core binds ConnectionStrings__Default to
+    // builder.Configuration.GetConnectionString("Default").
+    "ConnectionStrings__Default": "Host=host.docker.internal;Port=5432;Database=app;Username=postgres;Password=postgres"
+  },
+
+  // ASP.NET Core dev server. Open it from the VS Code Ports tab.
+  "forwardPorts": [8080],
+
+  // Persist Claude Code auth/settings/history so you don't re-login on rebuild.
+  // The config volume is the SAME one claude-box-dotnet uses, so a login made in
+  // either flow works in the other. History stays per-project via
+  // ${devcontainerId}. Note: claude-box-dotnet namespaces the config volume by
+  // CLAUDE_ORG; this flow has no such notion, so it always maps to the unprefixed
+  // volume. The NuGet cache is a content-addressed cache, shared across projects.
+  "mounts": [
+    "source=claude-code-config,target=/home/vscode/.claude,type=volume",
+    "source=claude-bash-history-${devcontainerId},target=/commandhistory,type=volume",
+    "source=claude-nuget-cache,target=/home/vscode/.nuget/packages,type=volume"
+  ],
+
+  // Restore INSIDE the container after create. Safe to re-run on rebuild, and
+  // guarded so an empty workspace (no solution/project yet) never fails it.
+  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.nuget && bash -c 'ls *.sln *.slnx *.csproj >/dev/null 2>&1 && { dotnet restore --locked-mode || dotnet restore; } || true'",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-dotnettools.csdevkit",
+        "ms-dotnettools.csharp",
+        "editorconfig.editorconfig",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "dotnet.defaultSolution": "disable",
+        "claudeCode.allowDangerouslySkipPermissions": true,
+        "claudeCode.initialPermissionMode": "bypassPermissions"
+      }
+    }
+  }
+
+  // To run the firewall on every start, drop init-firewall.sh in this folder and:
+  // "postStartCommand": "sudo /usr/local/bin/init-firewall.sh"
+}

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#
+# build-image — build the claude-dotnet-devcontainer image.
+#
+#   ./build-image           reuse cached layers, but always reinstall Claude Code
+#                           so the image gets the newest release (seconds)
+#   ./build-image --full    rebuild every layer and refresh the base image (minutes)
+#
+# This is the MAINTAINER-facing half of the tooling: it produces the image from
+# .devcontainer/. `claude-box-dotnet` is the USER-facing half and manages containers
+# only — it shells out to this script when an image is missing or when you ask it
+# to rebuild, so the build lives in exactly one place.
+#
+# Options:
+#   --full        rebuild from scratch: --no-cache and re-pull the base image
+#   --pull        only re-pull the base image, keeping the rest of the cache
+#   -t, --tag T   build tag T instead of the default
+#
+# Env overrides:
+#   IMAGE   image tag to build (default: claude-dotnet-devcontainer:latest)
+#   FULL    non-empty behaves like --full
+#
+set -euo pipefail
+
+IMAGE="${IMAGE:-claude-dotnet-devcontainer:latest}"
+FULL="${FULL:-}"
+PULL=""
+
+# Where this script REALLY lives, following symlinks: the build context is the
+# .devcontainer/ next to the real script, not next to a symlink on PATH.
+# `readlink -f` would do this in one step but is GNU-only, so walk the chain.
+SCRIPT_SRC="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SRC" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SRC")" && pwd)"
+  SCRIPT_SRC="$(readlink "$SCRIPT_SRC")"
+  case "$SCRIPT_SRC" in
+    /*) ;;
+    *) SCRIPT_SRC="$SCRIPT_DIR/$SCRIPT_SRC" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SRC")" && pwd)"
+CONTEXT="$SCRIPT_DIR/.devcontainer"
+
+usage() {
+  cat >&2 <<EOF
+Usage: build-image [--full] [--pull] [-t TAG]
+
+  --full        rebuild every layer (--no-cache) and re-pull the base image
+  --pull        re-pull the base image only, keeping the rest of the cache
+  -t, --tag T   build tag T (default: $IMAGE)
+
+With no options the cached layers are reused but Claude Code is always
+reinstalled, so the image picks up the newest release in seconds.
+EOF
+  exit "${1:-2}"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --full) FULL=1 ;;
+    --pull) PULL=1 ;;
+    -t | --tag)
+      shift
+      [ $# -gt 0 ] || { echo "--tag needs a value" >&2; exit 2; }
+      IMAGE="$1"
+      ;;
+    -h | --help | help) usage 0 ;;
+    *) echo "Unknown option: $1" >&2; usage 2 ;;
+  esac
+  shift
+done
+
+[ -f "$CONTEXT/Dockerfile" ] || {
+  echo "ERROR: no Dockerfile at $CONTEXT" >&2
+  exit 1
+}
+
+# A changing build arg invalidates the cache from the Claude Code install layer
+# down, so the installer re-runs and fetches the latest release while the apt/tool/
+# ssh layers above stay cached. The Dockerfile's RUN references the arg directly —
+# BuildKit only keys a layer on the ARGs it actually uses, so an unreferenced one
+# would be silently ignored and you'd never get an upgrade.
+BUILD_ARGS=(--build-arg "CLAUDE_INSTALL_BUST=$(date +%s)")
+if [ -n "$FULL" ]; then
+  echo "Full rebuild: every layer, plus a fresh base image (this takes a while)."
+  BUILD_ARGS+=(--no-cache --pull)
+elif [ -n "$PULL" ]; then
+  BUILD_ARGS+=(--pull)
+fi
+
+echo "Building '$IMAGE' from $CONTEXT ..."
+docker build "${BUILD_ARGS[@]}" -t "$IMAGE" "$CONTEXT"
+
+# Report what actually landed, so an upgrade is verifiable rather than assumed.
+VERSIONS="$(docker run --rm --entrypoint bash "$IMAGE" -lc 'echo "Claude Code $(claude --version)"; echo ".NET SDK $(dotnet --version)"' 2>/dev/null || echo unknown)"
+echo
+echo "Built '$IMAGE':"
+printf '%s\n' "$VERSIONS" | sed 's/^/  /'
+echo "Existing containers keep running their OLD image until recreated:"
+echo "  claude-box-dotnet rm <project-dir> && claude-box-dotnet start <project-dir>"

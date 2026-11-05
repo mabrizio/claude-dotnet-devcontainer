@@ -1,0 +1,28 @@
+# .NET
+bin/
+obj/
+artifacts/
+*.user
+*.suo
+.vs/
+*.nupkg
+TestResults/
+*.log
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# SSH private keys — never commit these
+.devcontainer/id_rsa
+.devcontainer/id_*
+*.pem
+id_rsa
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# Per-user Claude Code settings (absolute paths, personal allowlists)
+.claude/settings.local.json
