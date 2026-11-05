@@ -290,12 +290,69 @@ anything inside the container root-equivalent access to your host filesystem
 (`docker run -v /:/host …`), which is exactly what this project exists to prevent.
 A throwaway remote VM absorbs that risk instead.
 
+### What the Docker host is for
+
+The remote Docker host is a machine **you provide** where Claude has a user that is
+allowed to run Docker. It is Claude's test bench: while working on your project
+inside the container, Claude can use it to:
+
+- `docker build` the project's images and `docker run` them;
+- bring up whole stacks with `docker compose up` (app + PostgreSQL + Redis, message
+  brokers, etc.) and run integration or end-to-end tests against them;
+- exercise the project's own `Dockerfile` and `compose.yaml` the way CI or
+  production would, rather than only running `dotnet run` in the sandbox;
+- start throwaway dependencies (databases, mock services) for a test run and tear
+  them down afterwards.
+
+Everything it launches runs on that host, not in your dev container and not on your
+laptop. Published ports are reachable at the host's address, so Claude (or you)
+can hit a stack it started at `http://<REMOTE_DOCKER_HOST>:<port>`.
+
+### The default address is an example — change it
+
+The defaults (`dockerizer@192.168.122.10`) are simply the values of the
+environment this template was developed in (a libvirt VM on the default
+`192.168.122.0/24` network). **They will not work for you as-is.** Point them at
+your own Docker host by setting `REMOTE_DOCKER_USER` and `REMOTE_DOCKER_HOST`
+before running `claude-box-dotnet start`:
+
+```bash
+export REMOTE_DOCKER_USER=builder
+export REMOTE_DOCKER_HOST=docker-vm.example.internal   # hostname or IP
+./claude-box-dotnet start ~/Projects/my-app
+```
+
+The resulting `DOCKER_HOST` is `ssh://$REMOTE_DOCKER_USER@$REMOTE_DOCKER_HOST`.
+Note that `DOCKER_HOST` is fixed when a container is created, so after changing
+these run `claude-box-dotnet rm` + `start` for existing containers. (The
+"Without the helpers" example above also hard-codes the default; edit it there
+too.)
+
+### What the host must provide
+
+- A reachable **Docker Engine** (the daemon, not just the CLI), with a user in the
+  `docker` group (or otherwise allowed to use the socket). No root login is needed.
+- **SSH access** for that user, via the key described in
+  [How the key is handled](#how-the-key-is-handled) — the matching public key must
+  be in the user's `authorized_keys`.
+- Network reachability from the container to the host on port 22, and from
+  wherever you test to the ports your stacks publish.
+- Ideally **disposable**: a VM or a dedicated build box. Anything that can reach
+  this daemon is effectively root on the host (see
+  [Security notes](#security-notes--read-before-using---dangerously-skip-permissions)).
+
+It can be a local VM, a cloud instance, or a shared lab server — whatever you are
+comfortable letting Claude run arbitrary containers on. Different projects (or
+`CLAUDE_ORG` namespaces) can point at different hosts.
+
+### Configuration
+
 Configure it with these host environment variables (all optional):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `REMOTE_DOCKER_USER` | `dockerizer` | SSH user on the Docker host |
-| `REMOTE_DOCKER_HOST` | `192.168.122.10` | Address of the Docker host |
+| `REMOTE_DOCKER_USER` | `dockerizer` | SSH user on the Docker host (must be allowed to run Docker) |
+| `REMOTE_DOCKER_HOST` | `192.168.122.10` | Address of the Docker host — **the default is specific to the template's dev environment; override it** |
 | `DOCKER_SSH_KEY_OP_REF` | *(unset)* | 1Password reference for the SSH **private key**, e.g. `op://Private/dockerizer-ssh/private key` |
 | `DOCKER_SSH_KEY` | *(unset)* | The key material directly, bypassing 1Password |
 | `OP_SERVICE_ACCOUNT_TOKEN` | *(unset)* | 1Password service-account token, so `op` works non-interactively |
