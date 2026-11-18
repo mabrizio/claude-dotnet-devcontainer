@@ -108,8 +108,9 @@ Commands:
   shell   [DIR]   Open an interactive bash shell inside DIR's container
   info    [DIR]   Show status and details for DIR's container
   provider [NAME] Show, or set, the default secrets provider (1password | openssl)
-  seal    token | ssh-key FILE
-                  Create an openssl-encrypted secret file (for the openssl provider)
+  seal    token [DIR] | ssh-key FILE [DIR | --user]
+                  Create an openssl-encrypted secret file (for the openssl provider):
+                  per project; the SSH key can also be a per-user default (--user)
 
 PROJECT_DIR defaults to the current directory.
 EOF
@@ -210,32 +211,123 @@ load_provider() {
   esac
 }
 
-# Path of an encrypted secret file: $<ORG_>VAR, else $VAR, else a default in the
-# config dir (suffixed with the lower-cased org, so orgs never share a file).
-# Args: <variable name> <default basename>
-secret_file() {
+# The Docker-host SSH key: per project first, then a per-user default shared by
+# every project that has none of its own. DOCKER_SSH_KEY_FILE (also
+# CLAUDE_ORG-prefixed) is an explicit path override.
+ssh_key_project_file() { printf '%s/docker-ssh-key.enc' "$(project_secret_dir)"; }
+ssh_key_user_file() { printf '%s/docker-ssh-key.enc' "$CONFIG_DIR"; }
+ssh_key_file() {
   local f
-  f="$(first_env "$(org_var "$1")" "$1" || true)"
+  f="$(first_env "$(org_var DOCKER_SSH_KEY_FILE)" DOCKER_SSH_KEY_FILE || true)"
   if [ -z "$f" ]; then
-    f="$CONFIG_DIR/$2${CLAUDE_ORG:+-$(printf '%s' "$CLAUDE_ORG" | tr '[:upper:]' '[:lower:]')}.enc"
+    f="$(ssh_key_project_file)"
+    [ -f "$f" ] || f="$(ssh_key_user_file)"
   fi
   printf '%s' "$f"
 }
 
-# Read a line from the terminal without echo into the named variable, with all
-# line-ending/whitespace characters left for the caller to strip.
-# Args: <prompt> <variable name>
-read_hidden() {
-  local _line=""
-  if ! { : </dev/tty; } 2>/dev/null; then
-    echo "ERROR: no terminal available to prompt for: $1" >&2
+# Each project has its own Claude Code token (several Claude accounts can coexist),
+# kept OUTSIDE the project directory — the project is bind-mounted into the
+# container, so a file there would be visible to it. Keyed by the same name the
+# container uses, so it is per project and never in any repo.
+project_secret_dir() { printf '%s/projects/%s' "$CONFIG_DIR" "$NAME"; }
+
+# The token file for the current project (resolve_target must have run).
+# CLAUDE_TOKEN_FILE (also CLAUDE_ORG-prefixed) is an explicit path override.
+token_file() {
+  local f
+  f="$(first_env "$(org_var CLAUDE_TOKEN_FILE)" CLAUDE_TOKEN_FILE || true)"
+  [ -n "$f" ] || f="$(project_secret_dir)/claude-token.enc"
+  printf '%s' "$f"
+}
+
+# Other projects' token files, one per line.
+other_token_files() {
+  local f own
+  own="$(token_file)"
+  for f in "$CONFIG_DIR"/projects/*/claude-token.enc; do
+    [ -f "$f" ] && [ "$f" != "$own" ] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+# Remember which directory a project's secret dir belongs to, so the "copy from
+# another project" list can show something readable.
+note_workspace() {
+  local f="$1"
+  case "$f" in "$CONFIG_DIR"/projects/*) printf '%s\n' "$WORKSPACE" > "$(dirname "$f")/workspace" ;; esac
+}
+
+# Offered when a project has no token and we are creating its container (the token
+# is REQUIRED): copy another project's token file or enter a new one. Returns 0 only
+# when a token file now exists for this project. Without a terminal it just says what
+# to run; `start` then refuses to continue.
+offer_token_setup() {
+  local target f choice i=0 labels=() files=()
+  target="$(token_file)"
+  if ! tty_dev >/dev/null 2>&1; then
+    echo "No Claude Code token is stored for this project; store one with:" >&2
+    echo "  claude-box-dotnet seal token \"$WORKSPACE\"" >&2
     return 1
   fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    files+=("$f")
+    labels+=("$(cat "$(dirname "$f")/workspace" 2>/dev/null || basename "$(dirname "$f")")")
+  done < <(other_token_files)
+
+  while :; do
+    {
+      echo "No Claude Code token is stored for this project ($WORKSPACE); one is required."
+      for i in "${!files[@]}"; do
+        echo "  [$((i + 1))] copy the token from ${labels[$i]}"
+      done
+      echo "  [s] enter a new token for this project"
+      echo "  [q] cancel"
+    } >&2
+    read_prompt "Choice: " choice shown || return 1
+    case "$choice" in
+      s|S) cmd_seal token "$WORKSPACE" && break || return 1 ;;
+      q|Q) return 1 ;;
+      ''|*[!0-9]*) echo "Unrecognized choice." >&2 ;;
+      *)
+        if [ "$choice" -ge 1 ] && [ "$choice" -le "${#files[@]}" ]; then
+          mkdir -p "$(dirname "$target")" && chmod 700 "$(dirname "$target")" 2>/dev/null || true
+          ( umask 077; cp "${files[$((choice - 1))]}" "$target" )
+          note_workspace "$target"
+          echo "Copied the token from ${labels[$((choice - 1))]}." >&2
+          break
+        fi
+        echo "Unrecognized choice." >&2 ;;
+    esac
+  done
+  [ -f "$target" ]
+}
+
+# Where prompts are read from: /dev/tty when usable, else stdin when it is a
+# terminal (some Windows shells, e.g. Git Bash under winpty, have no /dev/tty).
+tty_dev() {
+  if { : </dev/tty; } 2>/dev/null; then echo /dev/tty
+  elif [ -t 0 ]; then echo /dev/stdin
+  else return 1
+  fi
+}
+
+# Prompt on the terminal and store the reply in the named variable. Whitespace is
+# left for the caller to strip. Args: <prompt> <variable name> <hidden|shown>
+read_prompt() {
+  local tty _line=""
+  tty="$(tty_dev)" || { echo "ERROR: no terminal available to prompt for: $1" >&2; return 1; }
   printf '%s' "$1" >&2
-  IFS= read -rs _line </dev/tty || { printf '\n' >&2; return 1; }
-  printf '\n' >&2
+  if [ "$3" = hidden ]; then
+    IFS= read -rs _line <"$tty" || { printf '\n' >&2; return 1; }
+    printf '\n' >&2
+  else
+    IFS= read -r _line <"$tty" || return 1
+  fi
   printf -v "$2" '%s' "$_line"
 }
+read_hidden() { read_prompt "$1" "$2" hidden; }
 
 # The passphrase for the encrypted files, asked for ONCE per command and reused.
 # Non-interactive override: CLAUDE_SECRETS_PASSPHRASE_FILE, then
@@ -296,9 +388,18 @@ resolve_token() {
   local src="" org_src="" ambient="${CLAUDE_CODE_OAUTH_TOKEN:-}"
 
   if [ "$PROVIDER" = openssl ]; then
-    src="$(secret_file CLAUDE_TOKEN_FILE claude-token)"
-    [ -f "$src" ] || src=""
-    [ -z "$CLAUDE_ORG" ] || org_src="$src"
+    src="$(token_file)"
+    if [ ! -f "$src" ]; then
+      src=""
+      # Only worth asking when we are about to create the container (that is the
+      # only time the token is used) and nothing else supplies one. The token is
+      # required, so `start` refuses to continue without it.
+      if [ -z "$ambient" ] && ! docker container inspect "$NAME" >/dev/null 2>&1 \
+         && offer_token_setup; then
+        src="$(token_file)"
+      fi
+    fi
+    org_src="$src"   # a per-project token is deliberate, so it outranks an exported one
   else
     if [ -n "$CLAUDE_ORG" ]; then
       org_src="$(first_env "$(org_var CLAUDE_TOKEN_OP_REF)" || true)"
@@ -309,8 +410,8 @@ resolve_token() {
 
   if [ -n "$org_src" ] && [ -n "$ambient" ]; then
     echo "NOTE: CLAUDE_CODE_OAUTH_TOKEN is already exported, but"
-    echo "      CLAUDE_ORG=$CLAUDE_ORG selects an org-scoped token ($src) —"
-    echo "      using the org-scoped token."
+    echo "      a more specific token is configured for this project ($src) —"
+    echo "      using that one."
     CLAUDE_CODE_OAUTH_TOKEN=""
   elif [ -n "$ambient" ]; then
     echo "Using the Claude token already exported as CLAUDE_CODE_OAUTH_TOKEN."
@@ -327,7 +428,6 @@ resolve_token() {
     fi
     if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
       echo "WARNING: could not decrypt $src (wrong passphrase?);" >&2
-      echo "         continuing without a token (you'll log in interactively)." >&2
       return 0
     fi
     export CLAUDE_CODE_OAUTH_TOKEN
@@ -337,13 +437,11 @@ resolve_token() {
 
   if ! command -v op >/dev/null 2>&1; then
     echo "WARNING: a Claude token reference is set but the 'op' CLI isn't installed;" >&2
-    echo "         continuing without a token (you'll log in interactively)." >&2
     return 0
   fi
   if ! CLAUDE_CODE_OAUTH_TOKEN="$(op_read "$src")"; then
     CLAUDE_CODE_OAUTH_TOKEN=""
     echo "WARNING: could not read $src from 1Password;" >&2
-    echo "         continuing without a token (you'll log in interactively)." >&2
     return 0
   fi
   export CLAUDE_CODE_OAUTH_TOKEN
@@ -365,7 +463,7 @@ resolve_ssh_key() {
   [ -z "$SSH_KEY" ] || return 0
 
   if [ "$PROVIDER" = openssl ]; then
-    ref="$(secret_file DOCKER_SSH_KEY_FILE docker-ssh-key)"
+    ref="$(ssh_key_file)"
     [ -f "$ref" ] || return 0
     if ! openssl_read "$ref" SSH_KEY || [ -z "$SSH_KEY" ]; then
       SSH_KEY=""
@@ -558,82 +656,91 @@ cmd_provider() {
 }
 
 # Create an openssl-encrypted secret file for the openssl provider.
-#   seal token              type the Claude token (hidden); whitespace/newlines stripped
-#   seal ssh-key <keyfile>  encrypt an existing private key file
+#   seal token [DIR]             type this project's Claude Code token (hidden);
+#                                whitespace/newlines are stripped
+#   seal ssh-key FILE [DIR]      encrypt an existing Docker-host private key for this
+#                                project; with --user instead of DIR, the per-user
+#                                default used by projects that have none of their own
 # The secret is never taken as an argument (it would land in shell history and
-# `ps`). The result is written 600 into the config dir after a decrypt round-trip
-# check, so a typo'd passphrase can't produce an unreadable file.
+# `ps`). The result is written 600 into the config dir (outside every project)
+# after a decrypt round-trip check, so a typo'd passphrase can't produce an
+# unreadable file. Uses `return`, not `exit`, so `start` can call it inline.
 cmd_seal() {
-  local kind="${1:-}" keyfile="${2:-}" target secret="" pass1="" pass2=""
+  local kind="${1:-}" arg="${2:-}" dir="" scope=project target secret="" pass1="" pass2="" f ref=""
   case "$kind" in
-    token)   target="$(secret_file CLAUDE_TOKEN_FILE claude-token)" ;;
-    ssh-key) target="$(secret_file DOCKER_SSH_KEY_FILE docker-ssh-key)"
-             [ -f "$keyfile" ] || { echo "Usage: claude-box-dotnet seal ssh-key <private-key-file>" >&2; exit 2; } ;;
-    *) echo "Usage: claude-box-dotnet seal token | seal ssh-key <private-key-file>" >&2; exit 2 ;;
+    token)   dir="$arg" ;;
+    ssh-key) dir="${3:-}"
+             if [ "$dir" = --user ]; then scope=user; dir=""; fi
+             [ -f "$arg" ] || { echo "Usage: claude-box-dotnet seal ssh-key <private-key-file> [DIR | --user]" >&2; return 2; } ;;
+    *) echo "Usage: claude-box-dotnet seal token [DIR] | seal ssh-key <private-key-file> [DIR | --user]" >&2; return 2 ;;
   esac
-  command -v openssl >/dev/null 2>&1 || { echo "ERROR: 'openssl' is not installed." >&2; exit 1; }
+  resolve_target "$dir"
+  if [ "$kind" = token ]; then target="$(token_file)"
+  elif [ "$scope" = user ]; then target="$(ssh_key_user_file)"
+  else target="$(first_env "$(org_var DOCKER_SSH_KEY_FILE)" DOCKER_SSH_KEY_FILE || ssh_key_project_file)"; fi
+  command -v openssl >/dev/null 2>&1 || { echo "ERROR: 'openssl' is not installed." >&2; return 1; }
 
   if [ -e "$target" ]; then
     local yn=""
-    printf '%s already exists. Overwrite? [y/N] ' "$target" >&2
-    IFS= read -r yn </dev/tty || exit 1
-    case "$yn" in y|Y|yes) ;; *) echo "Aborted." >&2; exit 1 ;; esac
+    read_prompt "$target already exists. Overwrite? [y/N] " yn shown || return 1
+    case "$yn" in y|Y|yes) ;; *) echo "Aborted." >&2; return 1 ;; esac
   fi
 
   if [ "$kind" = token ]; then
-    read_hidden "Claude token (input hidden): " secret || exit 1
+    read_hidden "Claude Code token for $WORKSPACE (input hidden): " secret || return 1
     secret="$(printf '%s' "$secret" | tr -d '[:space:]')"
   else
-    secret="$(tr -d '\r' < "$keyfile")"
+    secret="$(tr -d '\r' < "$arg")"
   fi
-  [ -n "$secret" ] || { echo "ERROR: the secret is empty." >&2; exit 1; }
+  [ -n "$secret" ] || { echo "ERROR: the secret is empty." >&2; return 1; }
 
-  # `start` asks for ONE passphrase and uses it for both files, so if the other
-  # file already exists, take its passphrase instead of inventing a new one.
-  local other other_plain=""
-  if [ "$kind" = token ]; then other="$(secret_file DOCKER_SSH_KEY_FILE docker-ssh-key)"
-  else other="$(secret_file CLAUDE_TOKEN_FILE claude-token)"; fi
+  # `start` asks for ONE passphrase and uses it for every file, so reuse the
+  # passphrase of an existing one (a Docker-host key, this project's token, or
+  # another project's token) instead of inventing a new one.
+  for f in "$(ssh_key_user_file)" "$(ssh_key_project_file)" "$(token_file)" $(other_token_files); do
+    if [ -f "$f" ] && [ "$f" != "$target" ]; then ref="$f"; break; fi
+  done
 
   if [ -n "${CLAUDE_SECRETS_PASSPHRASE_FILE:-}${CLAUDE_SECRETS_PASSPHRASE:-}" ]; then
-    get_passphrase || { echo "ERROR: could not read the passphrase." >&2; exit 1; }
-  elif [ -f "$other" ] && [ "$other" != "$target" ]; then
-    echo "Using the passphrase of the existing $(basename "$other") so one prompt unlocks both." >&2
-    if openssl_read "$other" other_plain; then
-      : # SECRETS_PASSPHRASE now holds the shared passphrase
-    else
+    get_passphrase || { echo "ERROR: could not read the passphrase." >&2; return 1; }
+  elif [ -n "$ref" ]; then
+    local ref_plain=""
+    echo "Using the passphrase of the existing $(basename "$ref") so one prompt unlocks everything." >&2
+    if ! openssl_read "$ref" ref_plain; then
       local yn=""
-      printf 'That passphrase does not match; use a different one for the new file? [y/N] ' >&2
-      IFS= read -r yn </dev/tty || exit 1
-      case "$yn" in y|Y|yes) ;; *) echo "Aborted." >&2; exit 1 ;; esac
-      read_hidden "New passphrase: " pass1 || exit 1
-      read_hidden "Repeat passphrase: " pass2 || exit 1
-      [ "$pass1" = "$pass2" ] && [ -n "$pass1" ] || { echo "ERROR: passphrases empty or not matching." >&2; exit 1; }
+      read_prompt 'That passphrase does not match; use a different one for the new file? [y/N] ' yn shown || return 1
+      case "$yn" in y|Y|yes) ;; *) echo "Aborted." >&2; return 1 ;; esac
+      read_hidden "New passphrase: " pass1 || return 1
+      read_hidden "Repeat passphrase: " pass2 || return 1
+      [ "$pass1" = "$pass2" ] && [ -n "$pass1" ] || { echo "ERROR: passphrases empty or not matching." >&2; return 1; }
       SECRETS_PASSPHRASE="$pass1"
-      echo "NOTE: the two files use different passphrases; 'start' will ask for each." >&2
+      echo "NOTE: the files use different passphrases; 'start' will ask for each." >&2
     fi
   else
-    read_hidden "New passphrase: " pass1 || exit 1
-    read_hidden "Repeat passphrase: " pass2 || exit 1
-    [ "$pass1" = "$pass2" ] || { echo "ERROR: passphrases do not match." >&2; exit 1; }
-    [ -n "$pass1" ] || { echo "ERROR: the passphrase is empty." >&2; exit 1; }
+    read_hidden "New passphrase: " pass1 || return 1
+    read_hidden "Repeat passphrase: " pass2 || return 1
+    [ "$pass1" = "$pass2" ] || { echo "ERROR: passphrases do not match." >&2; return 1; }
+    [ -n "$pass1" ] || { echo "ERROR: the passphrase is empty." >&2; return 1; }
     SECRETS_PASSPHRASE="$pass1"
   fi
 
-  mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+  mkdir -p "$(dirname "$target")" && chmod 700 "$CONFIG_DIR" "$(dirname "$target")" 2>/dev/null || true
   local tmp back
-  tmp="$(umask 077; mktemp "$CONFIG_DIR/.seal.XXXXXX")"
+  tmp="$(umask 077; mktemp "$(dirname "$target")/.seal.XXXXXX")"
   if ! printf '%s' "$secret" | OPENSSL_PASS="$SECRETS_PASSPHRASE" openssl "${OPENSSL_ARGS[@]}" -out "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     echo "ERROR: openssl could not encrypt (does your openssl support -pbkdf2?)." >&2
-    exit 1
+    return 1
   fi
   back="$(OPENSSL_PASS="$SECRETS_PASSPHRASE" openssl "${OPENSSL_ARGS[@]}" -d -in "$tmp" 2>/dev/null || true)"
   if [ "$back" != "$secret" ]; then
     rm -f "$tmp"
     echo "ERROR: the encrypted file did not decrypt back to the input; nothing written." >&2
-    exit 1
+    return 1
   fi
-  chmod 600 "$tmp" && mv "$tmp" "$target"
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$target"
+  note_workspace "$target"
   echo "Sealed $kind -> $target"
   echo "Use it with: claude-box-dotnet provider openssl"
 }
@@ -667,6 +774,22 @@ cmd_start() {
   # naming the builder, so the two responsibilities stay cleanly separated.
   if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "ERROR: image '$IMAGE' does not exist. Build it with: $BUILD_SCRIPT" >&2
+    exit 1
+  fi
+
+  # The Claude Code token is REQUIRED to create the container: without it Claude
+  # can't log in and the container is unusable. (An already-created container has
+  # its token baked in, so restarting one needs nothing here.)
+  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && ! docker container inspect "$NAME" >/dev/null 2>&1; then
+    cat >&2 <<MSG
+ERROR: no Claude Code token, and the container can't be created without one.
+       1. On the host run:  claude setup-token   (prints a long-lived token)
+       2. Store it, then re-run 'claude-box-dotnet start':
+            openssl:   claude-box-dotnet provider openssl
+                       claude-box-dotnet seal token "$WORKSPACE"
+            1Password: export $(org_var CLAUDE_TOKEN_OP_REF)="op://<vault>/<item>/<field>"
+            or export CLAUDE_CODE_OAUTH_TOKEN directly.
+MSG
     exit 1
   fi
 
@@ -861,7 +984,7 @@ case "$CMD" in
   shell)   cmd_shell   "${1:-}" ;;
   info)    cmd_info    "${1:-}" ;;
   provider) cmd_provider "${1:-}" ;;
-  seal)    cmd_seal    "${1:-}" "${2:-}" ;;
+  seal)    cmd_seal    "${1:-}" "${2:-}" "${3:-}" ;;
   -h|--help|help) usage 0 ;;
   *) echo "Unknown command: $CMD" >&2; usage 2 ;;
 esac

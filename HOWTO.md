@@ -28,8 +28,8 @@ The model: **one image, built once, mounted into any project directory.** You do
 
    The helper always takes a subcommand. The container commands — `start`,
    `stop`, `rm`, `shell` and `info` — take an optional project directory (default:
-   the current one). `provider` and `seal` manage your secrets setup and take no
-   directory (see "Secrets providers" below). Run
+   the current one). `provider` and `seal` manage your secrets setup (`provider` takes no
+   directory; see "Secrets providers" below). Run
    `claude-box-dotnet help` for the full list.
 3. Make sure **Docker** and **VS Code + the Dev Containers extension** are
    installed, then build the image once:
@@ -376,11 +376,11 @@ after every image rebuild.
 
 ## Secrets providers: 1Password or OpenSSL
 
-There are two optional secrets:
+There are two secrets:
 
-- the **Claude Code token**, so Claude Code in the container starts logged in
-  (without it you log in interactively);
-- the **Docker host SSH key**, for connecting to a separate host that runs OpenSSH
+- the **Claude Code token** (**required**): get one with `claude setup-token`.
+  `claude-box-dotnet start` refuses to create a container without it;
+- the **Docker host SSH key** (*optional*), for connecting to a separate host that runs OpenSSH
   and Docker, where the containers Claude builds and tests are created. Without it
   the Docker host is simply not available for automated testing; everything else
   works.
@@ -395,11 +395,15 @@ is the default.
 
   ```bash
   claude-box-dotnet provider openssl              # make it your default
-  claude-box-dotnet seal token                    # type the Claude Code token, then a passphrase
-  claude-box-dotnet seal ssh-key <keyfile>        # encrypt the Docker host's SSH private key
+  claude-box-dotnet seal token                    # this project's Claude Code token (typed, then a passphrase)
+  claude-box-dotnet seal ssh-key <keyfile>        # this project's Docker-host SSH key
+  claude-box-dotnet seal ssh-key <keyfile> --user # or a per-user default key
   ```
 
-  `start` then asks for the passphrase when it needs a secret.
+  The token is stored per project (you may use several Claude accounts); the key
+  is per project with a per-user fallback. Files live in `~/.config/claude-box/`,
+  outside your projects. `start` asks for the passphrase when it needs a secret, and
+  offers to copy the token from another project if this one has none.
 
 Switch any time with `claude-box-dotnet provider 1password|openssl`. Full details
 are in the README ("Secrets: 1Password or encrypted files").
@@ -431,7 +435,7 @@ committed, never baked into the image:
 | `OP_SERVICE_ACCOUNT_TOKEN` | 1Password service-account token, so `op` can read the two above non-interactively |
 | `DOCKER_SSH_KEY` | the SSH key material directly, bypassing the provider |
 | `SECRET_PROVIDER` | `1password` (default) or `openssl`; overrides the saved default (`claude-box-dotnet provider <name>`) for one run |
-| `CLAUDE_TOKEN_FILE` / `DOCKER_SSH_KEY_FILE` | openssl provider: paths of the encrypted files (defaults in `~/.config/claude-box/`, created by `claude-box-dotnet seal`) |
+| `CLAUDE_TOKEN_FILE` / `DOCKER_SSH_KEY_FILE` | openssl provider: paths of the encrypted files (explicit path overrides; by default per project under `~/.config/claude-box/projects/`, created by `claude-box-dotnet seal`) |
 | `CLAUDE_SECRETS_PASSPHRASE_FILE` / `CLAUDE_SECRETS_PASSPHRASE` | openssl provider: skip the passphrase prompt (scripting) |
 | `REMOTE_DOCKER_USER` / `REMOTE_DOCKER_HOST` | where `DOCKER_HOST=ssh://…` points (defaults `dockerizer` / `192.168.122.10`) |
 | `CLAUDE_ORG` | optional prefix for the three variables above, e.g. `CLAUDE_ORG=acme` → `ACME_CLAUDE_TOKEN_OP_REF` |
@@ -446,8 +450,8 @@ store — and `claude-box-dotnet start` refuses to reuse a container that was cr
 a different `CLAUDE_ORG` rather than silently mounting the wrong account's credentials.
 See the README's "Namespacing with `CLAUDE_ORG`" for the full precedence rules.
 
-Both are optional. Without the Claude Code token you just log in interactively; without
-the SSH key everything works except `docker` **inside** the container (the remote
+The Claude Code token is required: `start` stops with instructions if it has none.
+Only the SSH key is optional; without it everything works except `docker` **inside** the container (the remote
 Docker host isn't available for automated testing), and `claude-box-dotnet` prints a
 note at start. See the README's "Remote Docker daemon" section
 for why Docker is remote at all.

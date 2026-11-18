@@ -115,8 +115,8 @@ directory — each gets its own container, and they share one Claude login (per 
 when `CLAUDE_ORG` is set; see [Namespacing with `CLAUDE_ORG`](#namespacing-with-claude_org)).
 
 The helper takes a subcommand. The container commands take an optional project
-directory (default: the current one); `provider` and `seal` are per-user and take
-no directory:
+directory (default: the current one). `provider` is per-user and takes no directory;
+`seal` takes one (or `--user` for the SSH key):
 
 | Command | What it does |
 | --- | --- |
@@ -126,8 +126,8 @@ no directory:
 | `claude-box-dotnet shell [DIR]` | Open an interactive shell inside it |
 | `claude-box-dotnet info [DIR]` | Show status, image, workspace, and mapped port |
 | `claude-box-dotnet provider [1password\|openssl]` | Show, or set, the default secrets provider (saved in `~/.config/claude-box/config`) |
-| `claude-box-dotnet seal token` | Create the openssl-encrypted Claude Code token file (hidden prompt, then a passphrase) |
-| `claude-box-dotnet seal ssh-key FILE` | Create the openssl-encrypted Docker-host SSH key file from an existing private key |
+| `claude-box-dotnet seal token [DIR]` | Create the project's openssl-encrypted Claude Code token file (hidden prompt, then a passphrase) |
+| `claude-box-dotnet seal ssh-key FILE [DIR\|--user]` | Create the openssl-encrypted Docker-host SSH key file from an existing private key, for the project or as the per-user default |
 
 `provider` and `seal` are explained in [Secrets: 1Password or encrypted
 files](#secrets-1password-or-encrypted-files).
@@ -192,7 +192,7 @@ docker exec -u root claude-dotnet chown vscode:vscode \
 ```
 
 Two things `claude-box-dotnet` does that this doesn't: it resolves the Claude Code token and
-the remote-Docker SSH key from 1Password and injects them, so here you would log
+the remote-Docker SSH key from your secrets provider and injects them, so here you would log
 in interactively and place `~/.ssh/id_rsa` yourself (mode 600) before `docker`
 inside the container can reach the remote daemon.
 
@@ -502,13 +502,12 @@ nothing in this repo or the image needs to change.
 
 ### The two secrets
 
-Both are **optional**:
-
-- **Claude Code token** (`CLAUDE_CODE_OAUTH_TOKEN`): a long-lived login token for
-  Claude Code itself, created with `claude setup-token`. It lets Claude Code inside
-  the container start already logged in and stay logged in when the container is
-  recreated. Without it you simply log in interactively.
-- **Docker host SSH key**: the private key used to connect to a separate host that
+- **Claude Code token** (`CLAUDE_CODE_OAUTH_TOKEN`) — **required**. A long-lived
+  login token for Claude Code itself, created with `claude setup-token`. The
+  container can't be created without it: `claude-box-dotnet start` stops with an
+  error explaining how to provide one. It is per project, since you may use several
+  Claude accounts.
+- **Docker host SSH key** — *optional*. the private key used to connect to a separate host that
   runs OpenSSH and Docker. Containers that Claude builds and runs (to test your
   project, bring up compose stacks, run integration tests) are created **on that
   host**, never on yours; see [Remote Docker daemon](#remote-docker-daemon). If no
@@ -550,13 +549,33 @@ provider:
 
 ```bash
 claude-box-dotnet provider openssl
-claude-box-dotnet seal token                    # -> ~/.config/claude-box/claude-token.enc
-claude-box-dotnet seal ssh-key ~/.ssh/id_rsa    # -> ~/.config/claude-box/docker-ssh-key.enc
+cd ~/Projects/my-app                            # or pass the directory as the last argument
+claude-box-dotnet seal token                    # this project's Claude Code token
+claude-box-dotnet seal ssh-key ~/.ssh/id_rsa    # this project's Docker-host key
+claude-box-dotnet seal ssh-key ~/.ssh/id_rsa --user   # per-user default Docker-host key
 ```
+
+Where the files go (all under `~/.config/claude-box/`, **outside every project**,
+because a project is bind-mounted into the container and a file inside it would be
+visible there):
+
+| Secret | Per project | Fallback |
+| --- | --- | --- |
+| Claude Code token | `projects/<container-name>/claude-token.enc` | none: an account never silently crosses projects |
+| Docker-host SSH key | `projects/<container-name>/docker-ssh-key.enc` | `docker-ssh-key.enc` (per user) |
+
+The token is per project because you may work with several Claude accounts. The key
+is per project too, with a per-user default for the common case of one Docker host
+shared by all your projects.
+
+If a project has no token when `start` creates its container, `start` offers to
+**copy the token from another project** (same account) or enter a new one (or cancel).
+The token is required, so without one, or without a terminal, `start` stops and prints
+what to run.
 
 - `seal` never takes the secret as an argument (it would reach shell history and
   `ps`): the token is typed at a hidden prompt, and the SSH key is read from the file
-  you name. It asks for the passphrase twice, writes the file with mode 600, and
+  you name. The token's surrounding whitespace and newline are stripped. It asks for the passphrase twice, writes the file with mode 600, and
   checks that it decrypts back before keeping it.
 - `claude-box-dotnet start` prompts for the passphrase **only when it needs a
   secret**: not when the container is already running with its SSH key. One prompt
@@ -564,15 +583,18 @@ claude-box-dotnet seal ssh-key ~/.ssh/id_rsa    # -> ~/.config/claude-box/docker
 - Use the **same passphrase for both files**. When the other file already exists,
   `seal` asks for its passphrase and reuses it, so you only ever type one. If the
   two differ (you must confirm that), `start` asks for each separately.
-- With `CLAUDE_ORG=acme` the default files become `claude-token-acme.enc` and
-  `docker-ssh-key-acme.enc`, so organizations never share one.
 - The SSH key file may hold raw PEM (recommended) or base64; both are detected.
 - Overrides: `CLAUDE_TOKEN_FILE` / `DOCKER_SSH_KEY_FILE` (also `CLAUDE_ORG`-prefixed)
-  for the file paths; `CLAUDE_SECRETS_PASSPHRASE_FILE` or `CLAUDE_SECRETS_PASSPHRASE`
+  set an explicit file path instead of the locations above; `CLAUDE_SECRETS_PASSPHRASE_FILE` or `CLAUDE_SECRETS_PASSPHRASE`
   to skip the prompt in scripts.
 - Needs an `openssl` with `-pbkdf2` (OpenSSL 1.1.1+, or LibreSSL 3.1+). `openssl enc`
   is not authenticated, so a wrong passphrase is reported as a failed decrypt and the
   container starts without that secret.
+- **Windows hosts:** run `claude-box-dotnet` from WSL2 (recommended) or Git Bash, with
+  `openssl` available. Under WSL2 everything above works as on Linux. Under Git Bash
+  the config dir is `~/.config/claude-box` in your Windows profile, prompts fall back
+  to stdin when there is no `/dev/tty`, and the mode-600 file permissions are best
+  effort on NTFS.
 - This protects the files at rest. Once decrypted, the values are injected exactly
   as with 1Password. Never commit the `.enc` files (they are gitignored).
 

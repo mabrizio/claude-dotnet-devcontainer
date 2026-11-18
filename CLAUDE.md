@@ -40,7 +40,8 @@ secrets from 1Password on the host and injects them into the running container:
 - `CLAUDE_ORG` optionally prefixes the variable names (`CLAUDE_ORG=acme` →
   `ACME_CLAUDE_TOKEN_OP_REF`), and also namespaces the Claude credentials volume
   so two organizations never share one login.
-- `CLAUDE_TOKEN_OP_REF` → a long-lived Claude Code OAuth token (optional; without it, log in interactively).
+- `CLAUDE_TOKEN_OP_REF` → a long-lived Claude Code OAuth token (**required**: `start` refuses to create the
+  container without one; get it with `claude setup-token`).
 - `DOCKER_SSH_KEY_OP_REF` → the SSH key for the remote Docker host (a host running
   OpenSSH + Docker where test containers run; optional — without it that host is
   just unavailable for automated testing), stored
@@ -48,8 +49,9 @@ secrets from 1Password on the host and injects them into the running container:
   container, and only then moved into `~/.ssh/id_rsa`.
 
 Alternative provider: `claude-box-dotnet provider openssl` switches to
-openssl-encrypted files in `~/.config/claude-box/` (created with `claude-box-dotnet
-seal token|ssh-key FILE`; `start` prompts for the passphrase only when it needs a
+openssl-encrypted files under `~/.config/claude-box/` — outside the project, which is
+mounted into the container — per project (Claude Code token; Docker-host SSH key with
+a per-user fallback), created with `claude-box-dotnet seal token|ssh-key FILE`; `start` prompts for the passphrase only when it needs a
 secret). The default stays 1Password; the choice is per user, stored outside the repo.
 Never commit the `.enc` files.
 
