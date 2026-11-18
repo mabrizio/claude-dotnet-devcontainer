@@ -29,7 +29,7 @@ The model: **one image, built once, mounted into any project directory.** You do
    The helper always takes a subcommand. The container commands — `start`,
    `stop`, `rm`, `shell` and `info` — take an optional project directory (default:
    the current one). `provider` and `seal` manage your secrets setup and take no
-   directory (see "Secrets without 1Password" below). Run
+   directory (see "Secrets providers" below). Run
    `claude-box-dotnet help` for the full list.
 3. Make sure **Docker** and **VS Code + the Dev Containers extension** are
    installed, then build the image once:
@@ -374,13 +374,26 @@ after every image rebuild.
 
 ---
 
-## Secrets without 1Password
+## Secrets providers: 1Password or OpenSSL
 
-To use openssl-encrypted files instead of 1Password: run `claude setup-token` for a
-Claude token, then `claude-box-dotnet provider openssl`, `claude-box-dotnet seal token`
-and `claude-box-dotnet seal ssh-key <keyfile>`. `start` then asks for the passphrase
-when it needs a secret. Full details are in the README ("Secrets: 1Password or
-encrypted files").
+The Claude token and the remote-Docker SSH key can come from either of two
+providers. Pick whichever suits you; 1Password is the default.
+
+- **1Password** (default): export `CLAUDE_TOKEN_OP_REF` and `DOCKER_SSH_KEY_OP_REF`
+  (see the variable table below). Nothing else to set up.
+- **OpenSSL**: keep the secrets in files encrypted with a passphrase of your choice.
+  Run `claude setup-token` to get a Claude token, then:
+
+  ```bash
+  claude-box-dotnet provider openssl              # make it your default
+  claude-box-dotnet seal token                    # type the token, then a passphrase
+  claude-box-dotnet seal ssh-key <keyfile>        # encrypt your SSH private key
+  ```
+
+  `start` then asks for the passphrase when it needs a secret.
+
+Switch any time with `claude-box-dotnet provider 1password|openssl`. Full details
+are in the README ("Secrets: 1Password or encrypted files").
 
 ## Optional override env vars
 

@@ -543,7 +543,10 @@ claude-box-dotnet seal ssh-key ~/.ssh/id_rsa    # -> ~/.config/claude-box/docker
   checks that it decrypts back before keeping it.
 - `claude-box-dotnet start` prompts for the passphrase **only when it needs a
   secret**: not when the container is already running with its SSH key. One prompt
-  covers both files.
+  covers both files, and a mistyped passphrase gets 3 tries.
+- Use the **same passphrase for both files**. When the other file already exists,
+  `seal` asks for its passphrase and reuses it, so you only ever type one. If the
+  two differ (you must confirm that), `start` asks for each separately.
 - With `CLAUDE_ORG=acme` the default files become `claude-token-acme.enc` and
   `docker-ssh-key-acme.enc`, so organizations never share one.
 - The SSH key file may hold raw PEM (recommended) or base64; both are detected.

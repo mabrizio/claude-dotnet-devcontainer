@@ -241,6 +241,7 @@ read_hidden() {
 # Non-interactive override: CLAUDE_SECRETS_PASSPHRASE_FILE, then
 # CLAUDE_SECRETS_PASSPHRASE; otherwise the user is prompted.
 SECRETS_PASSPHRASE=""
+PASSPHRASE_PROMPTED=0
 get_passphrase() {
   [ -z "$SECRETS_PASSPHRASE" ] || return 0
   if [ -n "${CLAUDE_SECRETS_PASSPHRASE_FILE:-}" ]; then
@@ -249,23 +250,34 @@ get_passphrase() {
     SECRETS_PASSPHRASE="$CLAUDE_SECRETS_PASSPHRASE"
   else
     read_hidden "Passphrase for the encrypted secrets: " SECRETS_PASSPHRASE || return 1
+    PASSPHRASE_PROMPTED=1
   fi
   [ -n "$SECRETS_PASSPHRASE" ]
 }
 
-# Decrypt a file and print the plaintext. The passphrase goes to openssl through
-# its environment (-pass env:), never as an argument visible in `ps`. A wrong
-# passphrase is forgotten so the next secret prompts again.
+# Decrypt a file into the named variable. Args: <file> <variable name>.
+# Deliberately NOT a $(...) function: the passphrase cache must survive in this
+# shell, or every secret would prompt again. The passphrase goes to openssl
+# through its environment (-pass env:), never as an argument visible in `ps`.
+# A passphrase typed at the prompt gets 3 tries; one from a file/variable, 1.
 openssl_read() {
-  local file="$1" out
+  local file="$1" out tries=0
   [ -f "$file" ] || return 1
   command -v openssl >/dev/null 2>&1 || { echo "WARNING: 'openssl' is not installed." >&2; return 1; }
-  get_passphrase || return 1
-  if ! out="$(OPENSSL_PASS="$SECRETS_PASSPHRASE" openssl "${OPENSSL_ARGS[@]}" -d -in "$file" 2>/dev/null)"; then
+  while :; do
+    get_passphrase || return 1
+    tries=$((tries + 1))
+    if out="$(OPENSSL_PASS="$SECRETS_PASSPHRASE" openssl "${OPENSSL_ARGS[@]}" -d -in "$file" 2>/dev/null)"; then
+      printf -v "$2" '%s' "$out"
+      return 0
+    fi
     SECRETS_PASSPHRASE=""
-    return 1
-  fi
-  printf '%s' "$out"
+    if [ "$PASSPHRASE_PROMPTED" = 1 ] && [ "$tries" -lt 3 ]; then
+      echo "Wrong passphrase for $(basename "$file"); try again." >&2
+    else
+      return 1
+    fi
+  done
 }
 
 # Resolve a long-lived Claude OAuth token so login survives container recreation.
@@ -310,9 +322,10 @@ resolve_token() {
   fi
 
   if [ "$PROVIDER" = openssl ]; then
-    if ! CLAUDE_CODE_OAUTH_TOKEN="$(openssl_read "$src" | tr -d '[:space:]')" \
-       || [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-      CLAUDE_CODE_OAUTH_TOKEN=""
+    if openssl_read "$src" CLAUDE_CODE_OAUTH_TOKEN; then
+      CLAUDE_CODE_OAUTH_TOKEN="$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | tr -d '[:space:]')"
+    fi
+    if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
       echo "WARNING: could not decrypt $src (wrong passphrase?);" >&2
       echo "         continuing without a token (you'll log in interactively)." >&2
       return 0
@@ -354,7 +367,7 @@ resolve_ssh_key() {
   if [ "$PROVIDER" = openssl ]; then
     ref="$(secret_file DOCKER_SSH_KEY_FILE docker-ssh-key)"
     [ -f "$ref" ] || return 0
-    if ! SSH_KEY="$(openssl_read "$ref")" || [ -z "$SSH_KEY" ]; then
+    if ! openssl_read "$ref" SSH_KEY || [ -z "$SSH_KEY" ]; then
       SSH_KEY=""
       echo "WARNING: could not decrypt $ref (wrong passphrase?)." >&2
       return 0
@@ -574,8 +587,29 @@ cmd_seal() {
   fi
   [ -n "$secret" ] || { echo "ERROR: the secret is empty." >&2; exit 1; }
 
+  # `start` asks for ONE passphrase and uses it for both files, so if the other
+  # file already exists, take its passphrase instead of inventing a new one.
+  local other other_plain=""
+  if [ "$kind" = token ]; then other="$(secret_file DOCKER_SSH_KEY_FILE docker-ssh-key)"
+  else other="$(secret_file CLAUDE_TOKEN_FILE claude-token)"; fi
+
   if [ -n "${CLAUDE_SECRETS_PASSPHRASE_FILE:-}${CLAUDE_SECRETS_PASSPHRASE:-}" ]; then
     get_passphrase || { echo "ERROR: could not read the passphrase." >&2; exit 1; }
+  elif [ -f "$other" ] && [ "$other" != "$target" ]; then
+    echo "Using the passphrase of the existing $(basename "$other") so one prompt unlocks both." >&2
+    if openssl_read "$other" other_plain; then
+      : # SECRETS_PASSPHRASE now holds the shared passphrase
+    else
+      local yn=""
+      printf 'That passphrase does not match; use a different one for the new file? [y/N] ' >&2
+      IFS= read -r yn </dev/tty || exit 1
+      case "$yn" in y|Y|yes) ;; *) echo "Aborted." >&2; exit 1 ;; esac
+      read_hidden "New passphrase: " pass1 || exit 1
+      read_hidden "Repeat passphrase: " pass2 || exit 1
+      [ "$pass1" = "$pass2" ] && [ -n "$pass1" ] || { echo "ERROR: passphrases empty or not matching." >&2; exit 1; }
+      SECRETS_PASSPHRASE="$pass1"
+      echo "NOTE: the two files use different passphrases; 'start' will ask for each." >&2
+    fi
   else
     read_hidden "New passphrase: " pass1 || exit 1
     read_hidden "Repeat passphrase: " pass2 || exit 1
