@@ -26,6 +26,11 @@ The model: **one image, built once, mounted into any project directory.** You do
    The examples below use `claude-box-dotnet`; if you skip this, just call
    `~/tools/claude-dotnet-devcontainer/claude-box-dotnet` instead.
 
+   **On Windows** use the PowerShell ports (`build-image.ps1`, `claude-box-dotnet.ps1`)
+   with PowerShell 7.4+ instead of the bash scripts: same commands, run as
+   `./claude-box-dotnet.ps1 start` and so on. See the README's "Windows (PowerShell)"
+   section.
+
    The helper always takes a subcommand. The container commands — `start`,
    `stop`, `rm`, `shell` and `info` — take an optional project directory (default:
    the current one). `provider` and `seal` manage your secrets setup (`provider` takes no

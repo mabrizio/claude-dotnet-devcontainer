@@ -45,6 +45,8 @@ it — a clean starting point — not the end goal.
 │   └── bash_prompt.sh           # shows the project code name in the shell prompt
 ├── build-image                  # MAINTAINER: build the image from .devcontainer/
 ├── claude-box-dotnet               # USERS: run/manage a container per project, then attach
+├── build-image.ps1              # Windows (PowerShell 7.4+) port of build-image
+├── claude-box-dotnet.ps1        # Windows (PowerShell 7.4+) port of claude-box-dotnet
 ├── examples/
 │   ├── compose.yaml             # sample PROJECT compose (app + SQL Server) to copy into your project
 │   ├── .pre-commit-config.yaml  # sample PROJECT pre-commit hooks (dotnet format + guards)
@@ -131,6 +133,41 @@ directory (default: the current one). `provider` is per-user and takes no direct
 
 `provider` and `seal` are explained in [Secrets: 1Password or encrypted
 files](#secrets-1password-or-encrypted-files).
+
+## Windows (PowerShell)
+
+On a **Windows** host use the PowerShell ports instead of the bash scripts:
+`build-image.ps1` and `claude-box-dotnet.ps1`. They have the same commands and
+behavior, and they refuse to run on macOS/Linux/WSL, where you should use the bash
+scripts.
+
+**Requirements:** Windows, [PowerShell 7.4+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows)
+(`pwsh`, not the built-in Windows PowerShell 5.1), Docker Desktop, and `git`. The
+1Password CLI (`op`) is only needed if you use the 1Password provider.
+
+```powershell
+./build-image.ps1                 # same as ./build-image; options: -Full, -Pull, -Tag NAME
+./claude-box-dotnet.ps1 start     # start | stop | rm | shell | info | provider | seal
+./claude-box-dotnet.ps1 seal token
+./claude-box-dotnet.ps1 seal ssh-key C:\Users\me\.ssh\id_rsa --user
+```
+
+Everything in this README that says `claude-box-dotnet <command>` applies; just run it
+as `./claude-box-dotnet.ps1 <command>` (or put the repo directory on your `PATH`). A
+few Windows-specific points:
+
+- **No openssl needed.** The encrypted secret files use the same format as
+  `openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt`, implemented with .NET, so
+  `seal` and `start` work without installing openssl. Files made by either script
+  can be read by the other.
+- **Secrets location:** `%USERPROFILE%\.config\claude-box` (same layout as on Linux/macOS,
+  inside your user profile, which Windows already restricts to you).
+- **Container names** are `claude-dotnet-<dir>-<8 hex chars>`: a short hash of the
+  project path. They are not shared with the bash script's names, so use one set of
+  scripts per machine.
+- **Execution policy:** if PowerShell refuses to run the scripts, run
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, or launch them with
+  `pwsh -ExecutionPolicy Bypass -File ./claude-box-dotnet.ps1 start`.
 
 ## Upgrading Claude Code
 

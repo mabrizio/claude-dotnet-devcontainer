@@ -21,6 +21,13 @@ Both run on the **host**, not inside the container. They are deliberately split:
 | `build-image` | Building the image from `.devcontainer/` | `--full`, `--pull`, `-t TAG`. Busts the Docker cache at the Claude Code layer so a rebuild always installs the newest release. Prints the Claude Code and .NET SDK versions it built. |
 | `claude-box-dotnet` | Container lifecycle: `start`/`stop`/`rm`/`shell`/`info` | Never builds. Errors if the image is missing. One container per project dir, named `claude-dotnet-<dir>-<hash>`. Renamed from `claude-box` so it can sit on `PATH` beside the Python/Node siblings. |
 
+Windows hosts use the PowerShell 7.4+ ports `build-image.ps1` and
+`claude-box-dotnet.ps1` (same commands/behavior; they refuse to run off Windows, and
+the bash scripts are for everything else). **When you change a bash script, make the
+equivalent change in its `.ps1` port** (and vice versa) so they stay in sync. The
+encrypted secret files are format-compatible between the two (openssl-compatible
+`enc -pbkdf2` format; the ps1 implements it with .NET, no openssl needed).
+
 A running container keeps the image it was created from, so after `build-image`
 you must `claude-box-dotnet rm` + `claude-box-dotnet start` to pick the new one up.
 
