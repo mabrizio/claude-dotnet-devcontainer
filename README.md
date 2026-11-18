@@ -114,8 +114,9 @@ Switch projects anytime by running `./claude-box-dotnet start` against a differe
 directory — each gets its own container, and they share one Claude login (per org
 when `CLAUDE_ORG` is set; see [Namespacing with `CLAUDE_ORG`](#namespacing-with-claude_org)).
 
-The helper takes a subcommand and an optional project directory (default: the
-current one):
+The helper takes a subcommand. The container commands take an optional project
+directory (default: the current one); `provider` and `seal` are per-user and take
+no directory:
 
 | Command | What it does |
 | --- | --- |
@@ -124,6 +125,12 @@ current one):
 | `claude-box-dotnet rm [DIR]` | Stop and remove it, so the next `start` builds fresh |
 | `claude-box-dotnet shell [DIR]` | Open an interactive shell inside it |
 | `claude-box-dotnet info [DIR]` | Show status, image, workspace, and mapped port |
+| `claude-box-dotnet provider [1password\|openssl]` | Show, or set, the default secrets provider (saved in `~/.config/claude-box/config`) |
+| `claude-box-dotnet seal token` | Create the openssl-encrypted Claude token file (hidden prompt, then a passphrase) |
+| `claude-box-dotnet seal ssh-key FILE` | Create the openssl-encrypted SSH key file from an existing private key |
+
+`provider` and `seal` are explained in [Secrets: 1Password or encrypted
+files](#secrets-1password-or-encrypted-files).
 
 ## Upgrading Claude Code
 

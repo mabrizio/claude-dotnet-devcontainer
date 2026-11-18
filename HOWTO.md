@@ -26,9 +26,11 @@ The model: **one image, built once, mounted into any project directory.** You do
    The examples below use `claude-box-dotnet`; if you skip this, just call
    `~/tools/claude-dotnet-devcontainer/claude-box-dotnet` instead.
 
-   The helper always takes a subcommand — `start`, `stop`, `rm`, `shell`, or
-   `info` — plus an optional project directory (default: the current one).
-   Run `claude-box-dotnet help` for the full list.
+   The helper always takes a subcommand. The container commands — `start`,
+   `stop`, `rm`, `shell` and `info` — take an optional project directory (default:
+   the current one). `provider` and `seal` manage your secrets setup and take no
+   directory (see "Secrets without 1Password" below). Run
+   `claude-box-dotnet help` for the full list.
 3. Make sure **Docker** and **VS Code + the Dev Containers extension** are
    installed, then build the image once:
 
