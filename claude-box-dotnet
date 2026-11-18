@@ -38,7 +38,16 @@
 #   DOCKER_SSH_KEY_OP_REF    1Password ref for the remote Docker host's SSH key
 #   OP_SERVICE_ACCOUNT_TOKEN service-account token so `op` runs non-interactively
 #                            (the prefixed form may also be named <CLAUDE_ORG>_1P_TOKEN)
-#   DOCKER_SSH_KEY           the SSH key material directly, skipping 1Password
+#   DOCKER_SSH_KEY           the SSH key material directly, skipping the provider
+#
+# Alternative to 1Password: openssl-encrypted files. Pick the provider once with
+# `claude-box-dotnet provider openssl` (stored in ~/.config/claude-box/config, or
+# override per run with SECRET_PROVIDER), create the files with
+# `claude-box-dotnet seal token` / `seal ssh-key FILE`, and `start` prompts for the
+# passphrase when it needs a secret. Optional overrides:
+#   CLAUDE_TOKEN_FILE, DOCKER_SSH_KEY_FILE   paths (also CLAUDE_ORG-prefixed)
+#   CLAUDE_SECRETS_PASSPHRASE_FILE / CLAUDE_SECRETS_PASSPHRASE   skip the prompt
+#   CLAUDE_BOX_CONFIG_DIR    config/secrets dir (default ~/.config/claude-box)
 #
 set -euo pipefail
 
@@ -98,6 +107,9 @@ Commands:
   rm      [DIR]   Stop and remove the container for DIR (fresh start next time)
   shell   [DIR]   Open an interactive bash shell inside DIR's container
   info    [DIR]   Show status and details for DIR's container
+  provider [NAME] Show, or set, the default secrets provider (1password | openssl)
+  seal    token | ssh-key FILE
+                  Create an openssl-encrypted secret file (for the openssl provider)
 
 PROJECT_DIR defaults to the current directory.
 EOF
@@ -166,32 +178,126 @@ op_read() {
   OP_SERVICE_ACCOUNT_TOKEN="$(op_service_token)" op read "$ref" 2>/dev/null
 }
 
+# --- secret providers ---------------------------------------------------------
+# Secrets come from ONE provider, chosen per user (never per repo):
+#   1password  `op read` of an op:// reference (the default)
+#   openssl    a file encrypted with `openssl enc` (create it with `seal`)
+# Selection: $SECRET_PROVIDER, else SECRET_PROVIDER= in the config file below,
+# else 1password. There is no silent fallback between providers.
+CONFIG_DIR="${CLAUDE_BOX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-box}"
+CONFIG_FILE="$CONFIG_DIR/config"
+OPENSSL_ARGS=(enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:OPENSSL_PASS)
+
+# Read KEY from the config file. Parsed as plain KEY=VALUE lines, never sourced,
+# so the file can't run code.
+config_get() {
+  [ -f "$CONFIG_FILE" ] || return 1
+  local v
+  v="$(sed -n "s/^$1=//p" "$CONFIG_FILE" | tail -n1)"
+  [ -n "$v" ] || return 1
+  printf '%s' "$v"
+}
+
+# Sets PROVIDER (not via $(...), so a bad value can abort the script).
+load_provider() {
+  PROVIDER="${SECRET_PROVIDER:-}"
+  [ -n "$PROVIDER" ] || PROVIDER="$(config_get SECRET_PROVIDER || true)"
+  PROVIDER="$(printf '%s' "${PROVIDER:-1password}" | tr '[:upper:]' '[:lower:]')"
+  case "$PROVIDER" in
+    1password|openssl) ;;
+    *) echo "ERROR: unknown SECRET_PROVIDER '$PROVIDER' (use 1password or openssl)." >&2
+       exit 1 ;;
+  esac
+}
+
+# Path of an encrypted secret file: $<ORG_>VAR, else $VAR, else a default in the
+# config dir (suffixed with the lower-cased org, so orgs never share a file).
+# Args: <variable name> <default basename>
+secret_file() {
+  local f
+  f="$(first_env "$(org_var "$1")" "$1" || true)"
+  if [ -z "$f" ]; then
+    f="$CONFIG_DIR/$2${CLAUDE_ORG:+-$(printf '%s' "$CLAUDE_ORG" | tr '[:upper:]' '[:lower:]')}.enc"
+  fi
+  printf '%s' "$f"
+}
+
+# Read a line from the terminal without echo into the named variable, with all
+# line-ending/whitespace characters left for the caller to strip.
+# Args: <prompt> <variable name>
+read_hidden() {
+  local _line=""
+  if ! { : </dev/tty; } 2>/dev/null; then
+    echo "ERROR: no terminal available to prompt for: $1" >&2
+    return 1
+  fi
+  printf '%s' "$1" >&2
+  IFS= read -rs _line </dev/tty || { printf '\n' >&2; return 1; }
+  printf '\n' >&2
+  printf -v "$2" '%s' "$_line"
+}
+
+# The passphrase for the encrypted files, asked for ONCE per command and reused.
+# Non-interactive override: CLAUDE_SECRETS_PASSPHRASE_FILE, then
+# CLAUDE_SECRETS_PASSPHRASE; otherwise the user is prompted.
+SECRETS_PASSPHRASE=""
+get_passphrase() {
+  [ -z "$SECRETS_PASSPHRASE" ] || return 0
+  if [ -n "${CLAUDE_SECRETS_PASSPHRASE_FILE:-}" ]; then
+    SECRETS_PASSPHRASE="$(head -n1 "$CLAUDE_SECRETS_PASSPHRASE_FILE" 2>/dev/null | tr -d '\r')"
+  elif [ -n "${CLAUDE_SECRETS_PASSPHRASE:-}" ]; then
+    SECRETS_PASSPHRASE="$CLAUDE_SECRETS_PASSPHRASE"
+  else
+    read_hidden "Passphrase for the encrypted secrets: " SECRETS_PASSPHRASE || return 1
+  fi
+  [ -n "$SECRETS_PASSPHRASE" ]
+}
+
+# Decrypt a file and print the plaintext. The passphrase goes to openssl through
+# its environment (-pass env:), never as an argument visible in `ps`. A wrong
+# passphrase is forgotten so the next secret prompts again.
+openssl_read() {
+  local file="$1" out
+  [ -f "$file" ] || return 1
+  command -v openssl >/dev/null 2>&1 || { echo "WARNING: 'openssl' is not installed." >&2; return 1; }
+  get_passphrase || return 1
+  if ! out="$(OPENSSL_PASS="$SECRETS_PASSPHRASE" openssl "${OPENSSL_ARGS[@]}" -d -in "$file" 2>/dev/null)"; then
+    SECRETS_PASSPHRASE=""
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
 # Resolve a long-lived Claude OAuth token so login survives container recreation.
-# The token is never stored in this repo; it comes from 1Password on the HOST and
-# only the resolved value is passed in.
+# The token is never stored in this repo; it is read on the HOST (1Password or an
+# openssl-encrypted file, per SECRET_PROVIDER) and only the value is passed in.
 #
 # Precedence, most specific first:
-#   1. ${CLAUDE_ORG}_CLAUDE_TOKEN_OP_REF — naming an org-scoped reference is a
-#      deliberate statement about WHICH account this project uses, so it outranks
-#      whatever happens to be sitting in the ambient environment.
+#   1. an org-scoped source (${CLAUDE_ORG}_CLAUDE_TOKEN_OP_REF, or the org's
+#      token file) — naming one is a deliberate statement about WHICH account
+#      this project uses, so it outranks whatever is in the ambient environment.
 #   2. CLAUDE_CODE_OAUTH_TOKEN already exported — the manual escape hatch.
-#   3. CLAUDE_TOKEN_OP_REF — the unprefixed reference.
+#   3. the unprefixed source (CLAUDE_TOKEN_OP_REF, or the default token file).
 # The source actually used is always printed, and an ambiguous setup says so, so
 # you are never left guessing which account a container logged in as.
 resolve_token() {
-  local ref="" org_ref="" ambient="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+  local src="" org_src="" ambient="${CLAUDE_CODE_OAUTH_TOKEN:-}"
 
-  if [ -n "$CLAUDE_ORG" ]; then
-    org_ref="$(first_env "$(org_var CLAUDE_TOKEN_OP_REF)" || true)"
-  fi
-  ref="$org_ref"
-  if [ -z "$ref" ]; then
-    ref="$(first_env CLAUDE_TOKEN_OP_REF || true)"
+  if [ "$PROVIDER" = openssl ]; then
+    src="$(secret_file CLAUDE_TOKEN_FILE claude-token)"
+    [ -f "$src" ] || src=""
+    [ -z "$CLAUDE_ORG" ] || org_src="$src"
+  else
+    if [ -n "$CLAUDE_ORG" ]; then
+      org_src="$(first_env "$(org_var CLAUDE_TOKEN_OP_REF)" || true)"
+    fi
+    src="$org_src"
+    [ -n "$src" ] || src="$(first_env CLAUDE_TOKEN_OP_REF || true)"
   fi
 
-  if [ -n "$org_ref" ] && [ -n "$ambient" ]; then
+  if [ -n "$org_src" ] && [ -n "$ambient" ]; then
     echo "NOTE: CLAUDE_CODE_OAUTH_TOKEN is already exported, but"
-    echo "      CLAUDE_ORG=$CLAUDE_ORG selects $(org_var CLAUDE_TOKEN_OP_REF) —"
+    echo "      CLAUDE_ORG=$CLAUDE_ORG selects an org-scoped token ($src) —"
     echo "      using the org-scoped token."
     CLAUDE_CODE_OAUTH_TOKEN=""
   elif [ -n "$ambient" ]; then
@@ -199,36 +305,63 @@ resolve_token() {
     return 0
   fi
 
-  if [ -z "$ref" ]; then
+  if [ -z "$src" ]; then
     return 0
   fi
+
+  if [ "$PROVIDER" = openssl ]; then
+    if ! CLAUDE_CODE_OAUTH_TOKEN="$(openssl_read "$src" | tr -d '[:space:]')" \
+       || [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+      CLAUDE_CODE_OAUTH_TOKEN=""
+      echo "WARNING: could not decrypt $src (wrong passphrase?);" >&2
+      echo "         continuing without a token (you'll log in interactively)." >&2
+      return 0
+    fi
+    export CLAUDE_CODE_OAUTH_TOKEN
+    echo "Resolved Claude token from the encrypted file ($src)."
+    return 0
+  fi
+
   if ! command -v op >/dev/null 2>&1; then
     echo "WARNING: a Claude token reference is set but the 'op' CLI isn't installed;" >&2
     echo "         continuing without a token (you'll log in interactively)." >&2
     return 0
   fi
-  if ! CLAUDE_CODE_OAUTH_TOKEN="$(op_read "$ref")"; then
+  if ! CLAUDE_CODE_OAUTH_TOKEN="$(op_read "$src")"; then
     CLAUDE_CODE_OAUTH_TOKEN=""
-    echo "WARNING: could not read $ref from 1Password;" >&2
+    echo "WARNING: could not read $src from 1Password;" >&2
     echo "         continuing without a token (you'll log in interactively)." >&2
     return 0
   fi
   export CLAUDE_CODE_OAUTH_TOKEN
-  echo "Resolved Claude token from 1Password ($ref)."
+  echo "Resolved Claude token from 1Password ($src)."
 }
 
 # Resolve the SSH private key that reaches the remote Docker VM. Same posture as
 # the Claude token: the key is NEVER committed to this repo and NEVER baked into
-# the image — we read it from 1Password on the HOST and inject it into the running
-# container, so the image stays free of secrets.
-# Looked up as ${CLAUDE_ORG}_DOCKER_SSH_KEY_OP_REF, then DOCKER_SSH_KEY_OP_REF —
-# or set DOCKER_SSH_KEY to the key material directly and skip 1Password entirely.
+# the image — we read it on the HOST (1Password or an openssl-encrypted file, per
+# SECRET_PROVIDER) and inject it into the running container.
+# 1Password: ${CLAUDE_ORG}_DOCKER_SSH_KEY_OP_REF, then DOCKER_SSH_KEY_OP_REF.
+# openssl: ${CLAUDE_ORG}_DOCKER_SSH_KEY_FILE, DOCKER_SSH_KEY_FILE, or the default
+# file in the config dir. Either way DOCKER_SSH_KEY set directly skips the provider.
 # Sets SSH_KEY, empty when unavailable — callers warn rather than abort, so you
 # can still work in a container that just can't reach the remote daemon.
 resolve_ssh_key() {
   local ref
   SSH_KEY="${DOCKER_SSH_KEY:-}"
   [ -z "$SSH_KEY" ] || return 0
+
+  if [ "$PROVIDER" = openssl ]; then
+    ref="$(secret_file DOCKER_SSH_KEY_FILE docker-ssh-key)"
+    [ -f "$ref" ] || return 0
+    if ! SSH_KEY="$(openssl_read "$ref")" || [ -z "$SSH_KEY" ]; then
+      SSH_KEY=""
+      echo "WARNING: could not decrypt $ref (wrong passphrase?)." >&2
+      return 0
+    fi
+    echo "Resolved remote-Docker SSH key from the encrypted file ($ref)."
+    return 0
+  fi
 
   if ! ref="$(first_env "$(org_var DOCKER_SSH_KEY_OP_REF)" DOCKER_SSH_KEY_OP_REF)"; then
     return 0
@@ -320,9 +453,10 @@ check_ssh_key() {
 
 WARNING: no SSH key in '$NAME'. Docker commands inside the container
          (DOCKER_HOST=ssh://${REMOTE_DOCKER_USER}@${REMOTE_DOCKER_HOST}) will fail.
-         Export $(org_var DOCKER_SSH_KEY_OP_REF) with a 1Password reference
-         (see the README, "Remote Docker daemon"), or DOCKER_SSH_KEY with the key
-         material, then re-run 'claude-box-dotnet start'. Everything else works without it.
+         Export $(org_var DOCKER_SSH_KEY_OP_REF) with a 1Password reference, or
+         run 'claude-box-dotnet seal ssh-key <file>' and 'provider openssl'
+         (see the README, "Remote Docker daemon"), or set DOCKER_SSH_KEY to the
+         key material, then re-run 'claude-box-dotnet start'. Everything else works without it.
 EOF
 }
 
@@ -379,10 +513,111 @@ container_code_name() {
 
 # --- commands ---------------------------------------------------------------
 
+# Show or set the default secrets provider (stored in the per-user config file,
+# which lives outside the repo). Args: [1password|openssl]
+cmd_provider() {
+  local want
+  want="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  if [ -z "$want" ]; then
+    load_provider
+    echo "Secrets provider: $PROVIDER"
+    if [ -n "${SECRET_PROVIDER:-}" ]; then
+      echo "  (from the SECRET_PROVIDER environment variable)"
+    elif config_get SECRET_PROVIDER >/dev/null; then
+      echo "  (from $CONFIG_FILE)"
+    else
+      echo "  (default; set one with: claude-box-dotnet provider 1password|openssl)"
+    fi
+    return 0
+  fi
+  case "$want" in
+    1password|openssl) ;;
+    *) echo "ERROR: provider must be 1password or openssl." >&2; exit 2 ;;
+  esac
+  mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+  local tmp
+  tmp="$(umask 077; mktemp "$CONFIG_DIR/.config.XXXXXX")"
+  { [ ! -f "$CONFIG_FILE" ] || grep -v '^SECRET_PROVIDER=' "$CONFIG_FILE" || true
+    printf 'SECRET_PROVIDER=%s\n' "$want"; } > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  echo "Default secrets provider set to '$want' ($CONFIG_FILE)."
+}
+
+# Create an openssl-encrypted secret file for the openssl provider.
+#   seal token              type the Claude token (hidden); whitespace/newlines stripped
+#   seal ssh-key <keyfile>  encrypt an existing private key file
+# The secret is never taken as an argument (it would land in shell history and
+# `ps`). The result is written 600 into the config dir after a decrypt round-trip
+# check, so a typo'd passphrase can't produce an unreadable file.
+cmd_seal() {
+  local kind="${1:-}" keyfile="${2:-}" target secret="" pass1="" pass2=""
+  case "$kind" in
+    token)   target="$(secret_file CLAUDE_TOKEN_FILE claude-token)" ;;
+    ssh-key) target="$(secret_file DOCKER_SSH_KEY_FILE docker-ssh-key)"
+             [ -f "$keyfile" ] || { echo "Usage: claude-box-dotnet seal ssh-key <private-key-file>" >&2; exit 2; } ;;
+    *) echo "Usage: claude-box-dotnet seal token | seal ssh-key <private-key-file>" >&2; exit 2 ;;
+  esac
+  command -v openssl >/dev/null 2>&1 || { echo "ERROR: 'openssl' is not installed." >&2; exit 1; }
+
+  if [ -e "$target" ]; then
+    local yn=""
+    printf '%s already exists. Overwrite? [y/N] ' "$target" >&2
+    IFS= read -r yn </dev/tty || exit 1
+    case "$yn" in y|Y|yes) ;; *) echo "Aborted." >&2; exit 1 ;; esac
+  fi
+
+  if [ "$kind" = token ]; then
+    read_hidden "Claude token (input hidden): " secret || exit 1
+    secret="$(printf '%s' "$secret" | tr -d '[:space:]')"
+  else
+    secret="$(tr -d '\r' < "$keyfile")"
+  fi
+  [ -n "$secret" ] || { echo "ERROR: the secret is empty." >&2; exit 1; }
+
+  if [ -n "${CLAUDE_SECRETS_PASSPHRASE_FILE:-}${CLAUDE_SECRETS_PASSPHRASE:-}" ]; then
+    get_passphrase || { echo "ERROR: could not read the passphrase." >&2; exit 1; }
+  else
+    read_hidden "New passphrase: " pass1 || exit 1
+    read_hidden "Repeat passphrase: " pass2 || exit 1
+    [ "$pass1" = "$pass2" ] || { echo "ERROR: passphrases do not match." >&2; exit 1; }
+    [ -n "$pass1" ] || { echo "ERROR: the passphrase is empty." >&2; exit 1; }
+    SECRETS_PASSPHRASE="$pass1"
+  fi
+
+  mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+  local tmp back
+  tmp="$(umask 077; mktemp "$CONFIG_DIR/.seal.XXXXXX")"
+  if ! printf '%s' "$secret" | OPENSSL_PASS="$SECRETS_PASSPHRASE" openssl "${OPENSSL_ARGS[@]}" -out "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "ERROR: openssl could not encrypt (does your openssl support -pbkdf2?)." >&2
+    exit 1
+  fi
+  back="$(OPENSSL_PASS="$SECRETS_PASSPHRASE" openssl "${OPENSSL_ARGS[@]}" -d -in "$tmp" 2>/dev/null || true)"
+  if [ "$back" != "$secret" ]; then
+    rm -f "$tmp"
+    echo "ERROR: the encrypted file did not decrypt back to the input; nothing written." >&2
+    exit 1
+  fi
+  chmod 600 "$tmp" && mv "$tmp" "$target"
+  echo "Sealed $kind -> $target"
+  echo "Use it with: claude-box-dotnet provider openssl"
+}
+
 cmd_start() {
   resolve_target "${1:-}"
-  resolve_token
-  resolve_ssh_key
+  load_provider
+
+  # Secrets (and so the openssl passphrase prompt) are only needed to create the
+  # container (token) or to install a missing SSH key. A container that is already
+  # running with its key in place needs neither, so don't ask.
+  if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ] \
+     && docker exec -u "$CONTAINER_USER" "$NAME" test -s "/home/$CONTAINER_USER/.ssh/id_rsa" 2>/dev/null; then
+    echo "Container '$NAME' is already running with its SSH key; not reading secrets."
+    SSH_KEY=""
+  else
+    resolve_token
+    resolve_ssh_key
+  fi
   resolve_git_identity
 
   # Fixed host port if PORT is set, otherwise an auto-assigned (ephemeral) one so
@@ -590,6 +825,8 @@ case "$CMD" in
   rm)      cmd_rm      "${1:-}" ;;
   shell)   cmd_shell   "${1:-}" ;;
   info)    cmd_info    "${1:-}" ;;
+  provider) cmd_provider "${1:-}" ;;
+  seal)    cmd_seal    "${1:-}" "${2:-}" ;;
   -h|--help|help) usage 0 ;;
   *) echo "Unknown command: $CMD" >&2; usage 2 ;;
 esac

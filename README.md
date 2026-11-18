@@ -355,7 +355,7 @@ Configure it with these host environment variables (all optional):
 | `REMOTE_DOCKER_USER` | `dockerizer` | SSH user on the Docker host (must be allowed to run Docker) |
 | `REMOTE_DOCKER_HOST` | `192.168.122.10` | Address of the Docker host — **the default is specific to the template's dev environment; override it** |
 | `DOCKER_SSH_KEY_OP_REF` | *(unset)* | 1Password reference for the SSH **private key**, e.g. `op://Private/dockerizer-ssh/private key` |
-| `DOCKER_SSH_KEY` | *(unset)* | The key material directly, bypassing 1Password |
+| `DOCKER_SSH_KEY` | *(unset)* | The key material directly, bypassing the secrets provider (see [Secrets: 1Password or encrypted files](#secrets-1password-or-encrypted-files)) |
 | `OP_SERVICE_ACCOUNT_TOKEN` | *(unset)* | 1Password service-account token, so `op` works non-interactively |
 
 ### Namespacing with `CLAUDE_ORG`
@@ -490,6 +490,64 @@ don't have yet. That step is one-time, server-side, and manual.
 
 Rotating an existing key is the same process against the same 1Password item —
 nothing in this repo or the image needs to change.
+
+## Secrets: 1Password or encrypted files
+
+Two providers are supported; you pick **one** as your default and there is no silent
+fallback between them. A `DOCKER_SSH_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` exported
+directly always wins over either provider.
+
+| Provider | How secrets are stored | Selected by |
+| --- | --- | --- |
+| `1password` (default) | `op://` references, read with the `op` CLI | nothing — it is the default |
+| `openssl` | files encrypted with `openssl enc` (AES-256-CBC, PBKDF2) in `~/.config/claude-box/` | `claude-box-dotnet provider openssl` |
+
+The choice lives in a per-user file, `~/.config/claude-box/config` (outside the repo,
+never committed; override the directory with `CLAUDE_BOX_CONFIG_DIR`). Show or change it:
+
+```bash
+claude-box-dotnet provider            # show the current provider and where it came from
+claude-box-dotnet provider openssl    # make openssl the default
+SECRET_PROVIDER=1password claude-box-dotnet start   # override for one run
+```
+
+### Getting the Claude token
+
+On the host, run `claude setup-token`. It opens a browser login and prints a
+long-lived OAuth token (requires a Claude subscription). Store it with either
+provider:
+
+- **1Password:** save it in an item and export `CLAUDE_TOKEN_OP_REF`
+  (e.g. `op://Private/Claude Code/credential`).
+- **openssl:** `claude-box-dotnet seal token` — paste the token at the hidden prompt
+  (surrounding whitespace and the newline are stripped), then choose a passphrase.
+
+### The openssl provider
+
+```bash
+claude-box-dotnet provider openssl
+claude-box-dotnet seal token                    # -> ~/.config/claude-box/claude-token.enc
+claude-box-dotnet seal ssh-key ~/.ssh/id_rsa    # -> ~/.config/claude-box/docker-ssh-key.enc
+```
+
+- `seal` never takes the secret as an argument (it would reach shell history and
+  `ps`): the token is typed at a hidden prompt, and the SSH key is read from the file
+  you name. It asks for the passphrase twice, writes the file with mode 600, and
+  checks that it decrypts back before keeping it.
+- `claude-box-dotnet start` prompts for the passphrase **only when it needs a
+  secret**: not when the container is already running with its SSH key. One prompt
+  covers both files.
+- With `CLAUDE_ORG=acme` the default files become `claude-token-acme.enc` and
+  `docker-ssh-key-acme.enc`, so organizations never share one.
+- The SSH key file may hold raw PEM (recommended) or base64; both are detected.
+- Overrides: `CLAUDE_TOKEN_FILE` / `DOCKER_SSH_KEY_FILE` (also `CLAUDE_ORG`-prefixed)
+  for the file paths; `CLAUDE_SECRETS_PASSPHRASE_FILE` or `CLAUDE_SECRETS_PASSPHRASE`
+  to skip the prompt in scripts.
+- Needs an `openssl` with `-pbkdf2` (OpenSSL 1.1.1+, or LibreSSL 3.1+). `openssl enc`
+  is not authenticated, so a wrong passphrase is reported as a failed decrypt and the
+  container starts without that secret.
+- This protects the files at rest. Once decrypted, the values are injected exactly
+  as with 1Password. Never commit the `.enc` files (they are gitignored).
 
 ## Connecting to your database
 

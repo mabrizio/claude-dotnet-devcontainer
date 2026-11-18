@@ -372,6 +372,14 @@ after every image rebuild.
 
 ---
 
+## Secrets without 1Password
+
+To use openssl-encrypted files instead of 1Password: run `claude setup-token` for a
+Claude token, then `claude-box-dotnet provider openssl`, `claude-box-dotnet seal token`
+and `claude-box-dotnet seal ssh-key <keyfile>`. `start` then asks for the passphrase
+when it needs a secret. Full details are in the README ("Secrets: 1Password or
+encrypted files").
+
 ## Optional override env vars
 
 `claude-box-dotnet` reads these from your shell:
@@ -397,7 +405,10 @@ committed, never baked into the image:
 | `CLAUDE_TOKEN_OP_REF` | 1Password reference for a long-lived Claude OAuth token, so login survives container recreation |
 | `DOCKER_SSH_KEY_OP_REF` | 1Password reference for the SSH **private key** (stored base64-encoded) that reaches the remote Docker host |
 | `OP_SERVICE_ACCOUNT_TOKEN` | 1Password service-account token, so `op` can read the two above non-interactively |
-| `DOCKER_SSH_KEY` | the SSH key material directly, bypassing 1Password |
+| `DOCKER_SSH_KEY` | the SSH key material directly, bypassing the provider |
+| `SECRET_PROVIDER` | `1password` (default) or `openssl`; overrides the saved default (`claude-box-dotnet provider <name>`) for one run |
+| `CLAUDE_TOKEN_FILE` / `DOCKER_SSH_KEY_FILE` | openssl provider: paths of the encrypted files (defaults in `~/.config/claude-box/`, created by `claude-box-dotnet seal`) |
+| `CLAUDE_SECRETS_PASSPHRASE_FILE` / `CLAUDE_SECRETS_PASSPHRASE` | openssl provider: skip the passphrase prompt (scripting) |
 | `REMOTE_DOCKER_USER` / `REMOTE_DOCKER_HOST` | where `DOCKER_HOST=ssh://…` points (defaults `dockerizer` / `192.168.122.10`) |
 | `CLAUDE_ORG` | optional prefix for the three variables above, e.g. `CLAUDE_ORG=acme` → `ACME_CLAUDE_TOKEN_OP_REF` |
 

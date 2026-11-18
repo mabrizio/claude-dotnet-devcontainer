@@ -45,6 +45,12 @@ secrets from 1Password on the host and injects them into the running container:
   **base64-encoded**. It is written over stdin, decoded and validated inside the
   container, and only then moved into `~/.ssh/id_rsa`.
 
+Alternative provider: `claude-box-dotnet provider openssl` switches to
+openssl-encrypted files in `~/.config/claude-box/` (created with `claude-box-dotnet
+seal token|ssh-key FILE`; `start` prompts for the passphrase only when it needs a
+secret). The default stays 1Password; the choice is per user, stored outside the repo.
+Never commit the `.enc` files.
+
 Never commit a key, never bake one into the image, and never echo a resolved
 secret into logs or chat.
 

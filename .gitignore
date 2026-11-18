@@ -18,6 +18,7 @@ TestResults/
 .devcontainer/id_rsa
 .devcontainer/id_*
 *.pem
+*.enc
 id_rsa
 
 # OS / editor cruft
