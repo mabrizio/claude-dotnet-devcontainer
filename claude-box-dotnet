@@ -253,21 +253,48 @@ project_secret_dir() { printf '%s/projects/%s' "$CONFIG_DIR" "$NAME"; }
 # secrets and outside the project directory for the same reason.
 project_config_file() { printf '%s/config' "$(project_secret_dir)"; }
 
-# The token file for the current project (resolve_target must have run).
-# CLAUDE_TOKEN_FILE (also CLAUDE_ORG-prefixed) is an explicit path override.
+# The token file for the current project AND organization (resolve_target must have
+# run): claude-token-<org>.enc, so one project can switch between several Claude
+# accounts by switching CLAUDE_ORG. Prints nothing and returns 1 when CLAUDE_ORG is
+# unset, because the org is part of the name. CLAUDE_TOKEN_FILE (also
+# CLAUDE_ORG-prefixed) is an explicit path override that needs no org.
 token_file() {
   local f
   f="$(first_env "$(org_var CLAUDE_TOKEN_FILE)" CLAUDE_TOKEN_FILE || true)"
-  [ -n "$f" ] || f="$(project_secret_dir)/claude-token.enc"
+  if [ -z "$f" ]; then
+    [ -n "$CLAUDE_ORG" ] || return 1
+    f="$(project_secret_dir)/claude-token-$(printf '%s' "$CLAUDE_ORG" | tr '[:upper:]' '[:lower:]').enc"
+  fi
   printf '%s' "$f"
 }
 
-# Other projects' token files, one per line.
+# Why there is no token file, for the case where token_file failed.
+token_org_hint() {
+  echo "The Claude Code token is stored per organization; set CLAUDE_ORG first," >&2
+  echo "e.g.  CLAUDE_ORG=acme claude-box-dotnet seal token \"$WORKSPACE\"" >&2
+  if [ -f "$(project_secret_dir)/claude-token.enc" ]; then
+    echo "(An older org-less claude-token.enc exists in $(project_secret_dir);" >&2
+    echo " rename it to claude-token-<org>.enc to keep using it.)" >&2
+  fi
+}
+
+# Other projects' token files for the SAME organization, one per line (copying a
+# token across organizations would log the project in as the wrong account).
 other_token_files() {
   local f own
-  own="$(token_file)"
-  for f in "$CONFIG_DIR"/projects/*/claude-token.enc; do
+  [ -n "$CLAUDE_ORG" ] || return 0
+  own="$(token_file || true)"
+  for f in "$CONFIG_DIR"/projects/*/claude-token-"$(printf '%s' "$CLAUDE_ORG" | tr '[:upper:]' '[:lower:]')".enc; do
     [ -f "$f" ] && [ "$f" != "$own" ] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+# Every token file of every project and organization, for passphrase reuse.
+all_token_files() {
+  local f
+  for f in "$CONFIG_DIR"/projects/*/claude-token-*.enc; do
+    [ -f "$f" ] && printf '%s\n' "$f"
   done
   return 0
 }
@@ -285,10 +312,10 @@ note_workspace() {
 # to run; `start` then refuses to continue.
 offer_token_setup() {
   local target f choice i=0 labels=() files=()
-  target="$(token_file)"
+  target="$(token_file)" || { token_org_hint; return 1; }
   if ! tty_dev >/dev/null 2>&1; then
-    echo "No Claude Code token is stored for this project; store one with:" >&2
-    echo "  claude-box-dotnet seal token \"$WORKSPACE\"" >&2
+    echo "No Claude Code token is stored for this project and organization; store one with:" >&2
+    echo "  CLAUDE_ORG=$CLAUDE_ORG claude-box-dotnet seal token \"$WORKSPACE\"" >&2
     return 1
   fi
   while IFS= read -r f; do
@@ -299,7 +326,7 @@ offer_token_setup() {
 
   while :; do
     {
-      echo "No Claude Code token is stored for this project ($WORKSPACE); one is required."
+      echo "No Claude Code token is stored for this project ($WORKSPACE), org $CLAUDE_ORG; one is required."
       for i in "${!files[@]}"; do
         echo "  [$((i + 1))] copy the token from ${labels[$i]}"
       done
@@ -409,8 +436,14 @@ resolve_token() {
   local src="" org_src="" ambient="${CLAUDE_CODE_OAUTH_TOKEN:-}"
 
   if [ "$PROVIDER" = openssl ]; then
-    src="$(token_file)"
-    if [ ! -f "$src" ]; then
+    if ! src="$(token_file)"; then
+      # No CLAUDE_ORG, so there is no file to look for. Only worth saying so when
+      # we are about to create the container and nothing else supplies a token.
+      src=""
+      if [ -z "$ambient" ] && ! docker container inspect "$NAME" >/dev/null 2>&1; then
+        token_org_hint
+      fi
+    elif [ ! -f "$src" ]; then
       src=""
       # Only worth asking when we are about to create the container (that is the
       # only time the token is used) and nothing else supplies one. The token is
@@ -712,8 +745,8 @@ cmd_provider() {
 }
 
 # Create an openssl-encrypted secret file for the openssl provider.
-#   seal token [DIR]             type this project's Claude Code token (hidden);
-#                                whitespace/newlines are stripped
+#   seal token [DIR]             type this project's Claude Code token for the org in
+#                                CLAUDE_ORG (required; hidden input; whitespace stripped)
 #   seal ssh-key FILE [DIR]      encrypt an existing Docker-host private key for this
 #                                project; with --user instead of DIR, the per-user
 #                                default used by projects that have none of their own
@@ -731,7 +764,8 @@ cmd_seal() {
     *) echo "Usage: claude-box-dotnet seal token [DIR] | seal ssh-key <private-key-file> [DIR | --user]" >&2; return 2 ;;
   esac
   resolve_target "$dir"
-  if [ "$kind" = token ]; then target="$(token_file)"
+  if [ "$kind" = token ]; then
+    target="$(token_file)" || { echo "ERROR: no organization set." >&2; token_org_hint; return 1; }
   elif [ "$scope" = user ]; then target="$(ssh_key_user_file)"
   else target="$(first_env "$(org_var DOCKER_SSH_KEY_FILE)" DOCKER_SSH_KEY_FILE || ssh_key_project_file)"; fi
   command -v openssl >/dev/null 2>&1 || { echo "ERROR: 'openssl' is not installed." >&2; return 1; }
@@ -743,7 +777,7 @@ cmd_seal() {
   fi
 
   if [ "$kind" = token ]; then
-    read_hidden "Claude Code token for $WORKSPACE (input hidden): " secret || return 1
+    read_hidden "Claude Code token for $WORKSPACE${CLAUDE_ORG:+ (org $CLAUDE_ORG)} (input hidden): " secret || return 1
     secret="$(printf '%s' "$secret" | tr -d '[:space:]')"
   else
     secret="$(tr -d '\r' < "$arg")"
@@ -753,7 +787,7 @@ cmd_seal() {
   # `start` asks for ONE passphrase and uses it for every file, so reuse the
   # passphrase of an existing one (a Docker-host key, this project's token, or
   # another project's token) instead of inventing a new one.
-  for f in "$(ssh_key_user_file)" "$(ssh_key_project_file)" "$(token_file)" $(other_token_files); do
+  for f in "$(ssh_key_user_file)" "$(ssh_key_project_file)" $(all_token_files); do
     if [ -f "$f" ] && [ "$f" != "$target" ]; then ref="$f"; break; fi
   done
 
@@ -842,7 +876,7 @@ ERROR: no Claude Code token, and the container can't be created without one.
        1. On the host run:  claude setup-token   (prints a long-lived token)
        2. Store it, then re-run 'claude-box-dotnet start':
             openssl:   claude-box-dotnet provider openssl
-                       claude-box-dotnet seal token "$WORKSPACE"
+                       CLAUDE_ORG=<org> claude-box-dotnet seal token "$WORKSPACE"
             1Password: export $(org_var CLAUDE_TOKEN_OP_REF)="op://<vault>/<item>/<field>"
             or export CLAUDE_CODE_OAUTH_TOKEN directly.
 MSG

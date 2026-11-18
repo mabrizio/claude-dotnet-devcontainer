@@ -263,12 +263,29 @@ function Get-ProjectSecretDir { Join-Path (Join-Path $ConfigDir 'projects') $Nam
 # secrets and outside the project directory for the same reason.
 function Get-ProjectConfigFile { Join-Path (Get-ProjectSecretDir) 'config' }
 
-# The token file for the current project; CLAUDE_TOKEN_FILE (also CLAUDE_ORG-prefixed)
-# is an explicit path override.
+# The token file for the current project AND organization: claude-token-<org>.enc, so
+# one project can switch between several Claude accounts by switching CLAUDE_ORG.
+# Returns $null when CLAUDE_ORG is unset, because the org is part of the name.
+# CLAUDE_TOKEN_FILE (also CLAUDE_ORG-prefixed) is an explicit path override that needs
+# no org.
 function Get-TokenFile {
     $f = Get-FirstEnv @((Get-OrgVar 'CLAUDE_TOKEN_FILE'), 'CLAUDE_TOKEN_FILE')
-    if (-not $f) { $f = Join-Path (Get-ProjectSecretDir) 'claude-token.enc' }
+    if (-not $f) {
+        if (-not $ClaudeOrg) { return $null }
+        $f = Join-Path (Get-ProjectSecretDir) ('claude-token-' + $ClaudeOrg.ToLowerInvariant() + '.enc')
+    }
     return $f
+}
+
+# Why there is no token file, for the case where Get-TokenFile returned $null.
+function Write-TokenOrgHint {
+    Write-Err 'The Claude Code token is stored per organization; set CLAUDE_ORG first,'
+    Write-Err "e.g.  `$env:CLAUDE_ORG='acme'; claude-box-dotnet.ps1 seal token `"$Workspace`""
+    $old = Join-Path (Get-ProjectSecretDir) 'claude-token.enc'
+    if (Test-Path -LiteralPath $old -PathType Leaf) {
+        Write-Err "(An older org-less claude-token.enc exists in $(Get-ProjectSecretDir);"
+        Write-Err ' rename it to claude-token-<org>.enc to keep using it.)'
+    }
 }
 
 # The Docker-host SSH key: per project first, then a per-user default.
@@ -285,16 +302,29 @@ function Get-SshKeyFile {
 
 function Get-FullPathSafe([string]$P) { [System.IO.Path]::GetFullPath($P) }
 
-# Other projects' token files.
+# Other projects' token files for the SAME organization (copying a token across
+# organizations would log the project in as the wrong account).
 function Get-OtherTokenFiles {
-    $own = Get-FullPathSafe (Get-TokenFile)
+    if (-not $ClaudeOrg) { return @() }
+    $own = Get-TokenFile
+    $own = if ($own) { Get-FullPathSafe $own } else { '' }
     $root = Join-Path $ConfigDir 'projects'
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
+    $leaf = 'claude-token-' + $ClaudeOrg.ToLowerInvariant() + '.enc'
     $found = foreach ($d in Get-ChildItem -LiteralPath $root -Directory) {
-        $f = Join-Path $d.FullName 'claude-token.enc'
+        $f = Join-Path $d.FullName $leaf
         if ((Test-Path -LiteralPath $f -PathType Leaf) -and ((Get-FullPathSafe $f) -ne $own)) { $f }
     }
     return @($found)
+}
+
+# Every token file of every project and organization, for passphrase reuse.
+function Get-AllTokenFiles {
+    $root = Join-Path $ConfigDir 'projects'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
+    return @(Get-ChildItem -LiteralPath $root -Directory | ForEach-Object {
+            Get-ChildItem -LiteralPath $_.FullName -Filter 'claude-token-*.enc' -File | ForEach-Object FullName
+        })
 }
 
 # Remember which directory a project's secret dir belongs to, so "copy from another
@@ -424,9 +454,10 @@ function Read-EncryptedFile([string]$File) {
 # token file now exists for this project.
 function Invoke-OfferTokenSetup {
     $target = Get-TokenFile
+    if (-not $target) { Write-TokenOrgHint; return $false }
     if (-not (Test-Interactive)) {
-        Write-Err 'No Claude Code token is stored for this project; store one with:'
-        Write-Err "  claude-box-dotnet.ps1 seal token `"$Workspace`""
+        Write-Err 'No Claude Code token is stored for this project and organization; store one with:'
+        Write-Err "  `$env:CLAUDE_ORG='$ClaudeOrg'; claude-box-dotnet.ps1 seal token `"$Workspace`""
         return $false
     }
     $files = @(Get-OtherTokenFiles)
@@ -472,7 +503,13 @@ function Resolve-Token {
 
     if ($Provider -eq 'openssl') {
         $src = Get-TokenFile
-        if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        if (-not $src) {
+            # No CLAUDE_ORG, so there is no file to look for. Only worth saying so when
+            # we are about to create the container and nothing else supplies a token.
+            $src = ''
+            if (-not $ambient -and -not (Test-ContainerExists)) { Write-TokenOrgHint }
+        }
+        elseif (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
             $src = ''
             # Only worth asking when we are about to create the container (the only
             # time the token is used) and nothing else supplies one.
@@ -757,7 +794,10 @@ function Invoke-Seal([string[]]$SealArgs) {
         }
     }
     Resolve-Target $dir
-    if ($kind -eq 'token') { $target = Get-TokenFile }
+    if ($kind -eq 'token') {
+        $target = Get-TokenFile
+        if (-not $target) { Write-Err 'ERROR: no organization set.'; Write-TokenOrgHint; return 1 }
+    }
     elseif ($scope -eq 'user') { $target = Get-SshKeyUserFile }
     else {
         $target = Get-FirstEnv @((Get-OrgVar 'DOCKER_SSH_KEY_FILE'), 'DOCKER_SSH_KEY_FILE')
@@ -771,7 +811,7 @@ function Invoke-Seal([string[]]$SealArgs) {
     }
 
     if ($kind -eq 'token') {
-        $typed = Read-Prompt "Claude Code token for $Workspace (input hidden)" -Hidden
+        $typed = Read-Prompt "Claude Code token for $Workspace$(if ($ClaudeOrg) { " (org $ClaudeOrg)" }) (input hidden)" -Hidden
         if ($null -eq $typed) { return 1 }
         $secret = $typed -replace '\s', ''
     }
@@ -784,7 +824,7 @@ function Invoke-Seal([string[]]$SealArgs) {
     # passphrase of an existing one instead of inventing a new one.
     $targetFull = Get-FullPathSafe $target
     $ref = ''
-    foreach ($f in @((Get-SshKeyUserFile), (Get-SshKeyProjectFile), (Get-TokenFile)) + @(Get-OtherTokenFiles)) {
+    foreach ($f in @((Get-SshKeyUserFile), (Get-SshKeyProjectFile)) + @(Get-AllTokenFiles)) {
         if ((Test-Path -LiteralPath $f -PathType Leaf) -and ((Get-FullPathSafe $f) -ne $targetFull)) { $ref = $f; break }
     }
 
@@ -869,7 +909,7 @@ ERROR: no Claude Code token, and the container can't be created without one.
        1. On the host run:  claude setup-token   (prints a long-lived token)
        2. Store it, then re-run 'claude-box-dotnet.ps1 start':
             openssl:   claude-box-dotnet.ps1 provider openssl
-                       claude-box-dotnet.ps1 seal token "$Workspace"
+                       `$env:CLAUDE_ORG='<org>'; claude-box-dotnet.ps1 seal token "$Workspace"
             1Password: set $(Get-OrgVar 'CLAUDE_TOKEN_OP_REF') to "op://<vault>/<item>/<field>"
             or set CLAUDE_CODE_OAUTH_TOKEN directly.
 "@

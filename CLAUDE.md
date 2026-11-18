@@ -57,7 +57,8 @@ secrets from 1Password on the host and injects them into the running container:
 
 Alternative provider: `claude-box-dotnet provider openssl` switches to
 openssl-encrypted files under `~/.config/claude-box/` — outside the project, which is
-mounted into the container — per project (Claude Code token; Docker-host SSH key with
+mounted into the container — per project (Claude Code token, one file per `CLAUDE_ORG` —
+`claude-token-<org>.enc`, so `CLAUDE_ORG` is required to seal/use it; Docker-host SSH key with
 a per-user fallback), created with `claude-box-dotnet seal token|ssh-key FILE`; `start` prompts for the passphrase only when it needs a
 secret. The provider itself is per project with a per-user default
 (`provider NAME [DIR | --user]`, project by default like `seal`; env `SECRET_PROVIDER` > project > user > 1password),

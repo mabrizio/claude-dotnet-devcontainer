@@ -476,7 +476,8 @@ is the default.
 
   ```bash
   claude-box-dotnet provider openssl              # use it for this project (add --user for your default)
-  claude-box-dotnet seal token                    # this project's Claude Code token (typed, then a passphrase)
+  export CLAUDE_ORG=acme                          # required: the token file is per organization
+  claude-box-dotnet seal token                    # this project's token for that org (typed, then a passphrase)
   claude-box-dotnet seal ssh-key <keyfile>        # this project's Docker-host SSH key
   claude-box-dotnet seal ssh-key <keyfile> --user # or a per-user default key
   ```

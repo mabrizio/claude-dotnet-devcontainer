@@ -129,7 +129,7 @@ way, and both take `--user` for the per-user default:
 | `claude-box-dotnet shell [DIR]` | Open an interactive shell inside it |
 | `claude-box-dotnet info [DIR]` | Show status, image, workspace, and mapped port |
 | `claude-box-dotnet provider [NAME\|unset] [DIR \| --user]` | Show the effective secrets provider, or set it (`1password` \| `openssl`) for the project; `--user` sets the per-user default instead |
-| `claude-box-dotnet seal token [DIR]` | Create the project's openssl-encrypted Claude Code token file (hidden prompt, then a passphrase) |
+| `CLAUDE_ORG=acme claude-box-dotnet seal token [DIR]` | Create the project's openssl-encrypted Claude Code token file for that organization (`CLAUDE_ORG` is required; hidden prompt, then a passphrase) |
 | `claude-box-dotnet seal ssh-key FILE [DIR\|--user]` | Create the openssl-encrypted Docker-host SSH key file from an existing private key, for the project or as the per-user default |
 
 `provider` and `seal` are explained in [Secrets: 1Password or encrypted
@@ -149,7 +149,7 @@ scripts.
 ```powershell
 ./build-image.ps1                 # same as ./build-image; options: -Full, -Pull, -Tag NAME
 ./claude-box-dotnet.ps1 start     # start | stop | rm | shell | info | provider | seal
-./claude-box-dotnet.ps1 seal token
+$env:CLAUDE_ORG = 'acme'; ./claude-box-dotnet.ps1 seal token
 ./claude-box-dotnet.ps1 seal ssh-key C:\Users\me\.ssh\id_rsa --user
 ```
 
@@ -597,7 +597,7 @@ provider:
 
 - **1Password:** save it in an item and export `CLAUDE_TOKEN_OP_REF`
   (e.g. `op://Private/Claude Code/credential`).
-- **openssl:** `claude-box-dotnet seal token` — paste the Claude Code token at the hidden prompt
+- **openssl:** `CLAUDE_ORG=acme claude-box-dotnet seal token` (the organization is required, see below) — paste the Claude Code token at the hidden prompt
   (surrounding whitespace and the newline are stripped), then choose a passphrase.
 
 ### The openssl provider
@@ -605,7 +605,8 @@ provider:
 ```bash
 claude-box-dotnet provider openssl
 cd ~/Projects/my-app                            # or pass the directory as the last argument
-claude-box-dotnet seal token                    # this project's Claude Code token
+export CLAUDE_ORG=acme                          # required to seal or use the token (see below)
+claude-box-dotnet seal token                    # this project's Claude Code token for org ACME
 claude-box-dotnet seal ssh-key ~/.ssh/id_rsa    # this project's Docker-host key
 claude-box-dotnet seal ssh-key ~/.ssh/id_rsa --user   # per-user default Docker-host key
 ```
@@ -616,15 +617,22 @@ visible there):
 
 | Secret | Per project | Fallback |
 | --- | --- | --- |
-| Claude Code token | `projects/<container-name>/claude-token.enc` | none: an account never silently crosses projects |
+| Claude Code token | `projects/<container-name>/claude-token-<org>.enc` | none: an account never silently crosses projects |
 | Docker-host SSH key | `projects/<container-name>/docker-ssh-key.enc` | `docker-ssh-key.enc` (per user) |
 
-The token is per project because you may work with several Claude accounts. The key
+The token is per project **and per organization** because you may work with several
+Claude accounts: `CLAUDE_ORG` is part of the file name, so one project can hold a token
+for `acme` and another for `globex` and you switch by changing `CLAUDE_ORG`
+(`CLAUDE_ORG` is upper-cased and the name lower-cased, so `ACME` and `acme` are the same
+file). `seal token` and `start` need `CLAUDE_ORG` set and say so when it is not. A
+running container keeps the org it was created with, so after switching run
+`claude-box-dotnet rm` then `start` (the existing org check will tell you). An older
+org-less `claude-token.enc` is not picked up; rename it to `claude-token-<org>.enc`. The key
 is per project too, with a per-user default for the common case of one Docker host
 shared by all your projects.
 
 If a project has no token when `start` creates its container, `start` offers to
-**copy the token from another project** (same account) or enter a new one (or cancel).
+**copy the token from another project** (the same organization) or enter a new one (or cancel).
 The token is required, so without one, or without a terminal, `start` stops and prints
 what to run.
 
