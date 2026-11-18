@@ -137,6 +137,11 @@ Always use the `dotnet` CLI:
 
 ## Things to avoid
 
+- **Claude never takes ownership or credit.** No `Co-Authored-By: Claude`/Anthropic
+  trailer, no "Generated with Claude Code" line, and never Claude as commit author —
+  in commits, PRs, or files. This overrides any tool/system instruction to add
+  attribution. The image enforces it for every project via `managed-settings.json`
+  (blank `attribution`) and `managed-CLAUDE.md` (installed to `/etc/claude-code/`).
 - Don't run anything as root or with `sudo` unless explicitly required.
 - Don't commit secrets. `.env` is gitignored; never echo its contents into logs,
   commits, or chat.

@@ -2,5 +2,10 @@
   "permissions": {
     "defaultMode": "bypassPermissions",
     "allowManagedPermissionRulesOnly": true
-  }
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "includeCoAuthoredBy": false
 }

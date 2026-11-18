@@ -39,6 +39,7 @@ it — a clean starting point — not the end goal.
 │   ├── devcontainer.json        # optional: per-project "Reopen in Container" flow (see below)
 │   ├── ssh_config               # SSH client defaults for reaching the remote Docker daemon
 │   ├── managed-settings.json    # container-only Claude policy (bypassPermissions)
+│   ├── managed-CLAUDE.md        # container-wide rule: Claude takes no attribution/co-author credit
 │   ├── local_claude.json        # pre-seeds Claude onboarding/trust so the TUI starts at the prompt
 │   ├── inputrc                  # readline history-search on Up/Down
 │   └── bash_prompt.sh           # shows the project code name in the shell prompt

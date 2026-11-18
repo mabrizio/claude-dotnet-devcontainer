@@ -128,6 +128,10 @@ RUN chmod 600 /home/$USERNAME/.ssh/config
 # any allow at any scope). Combined with bypassPermissions, this is the "run
 # Claude unrestricted in isolation" posture this container exists for.
 COPY managed-settings.json /etc/claude-code/managed-settings.json
+# Managed memory file, loaded in every project: the no-attribution rule (no Claude
+# co-author trailers or "generated with" lines). managed-settings.json also blanks
+# Claude Code's built-in commit/PR attribution, so the rule holds in both layers.
+COPY managed-CLAUDE.md /etc/claude-code/CLAUDE.md
 
 # --- Environment -------------------------------------------------------------
 # DOTNET_CLI_TELEMETRY_OPTOUT / DOTNET_NOLOGO / DOTNET_SKIP_FIRST_TIME_EXPERIENCE
