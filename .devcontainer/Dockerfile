@@ -11,7 +11,7 @@ FROM mcr.microsoft.com/devcontainers/dotnet:10.0
 ARG USERNAME=vscode
 
 # --- System tools -----------------------------------------------------------
-# sqlcmd (go-sqlcmd, below)    -> `sqlcmd` to talk to an external SQL Server
+# sqlcmd (mssql-tools18, below) -> `sqlcmd` to talk to an external SQL Server
 # iptables / ipset / dnsutils  -> needed only by the optional egress firewall
 # ripgrep                      -> fast code search
 # python3 / pipx               -> ONLY so `pre-commit` can be installed below. Python
@@ -51,15 +51,18 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # --- sqlcmd (SQL Server client) ---------------------------------------------
-# go-sqlcmd from Microsoft's apt repo: a plain `sqlcmd` on PATH, no EULA prompt,
-# available for amd64 and arm64.
+# mssql-tools18 from Microsoft's apt repo (amd64 and arm64). Installing it means
+# accepting Microsoft's EULA, hence ACCEPT_EULA=Y. Its binaries live in
+# /opt/mssql-tools18/bin; symlink sqlcmd onto PATH. Note this sqlcmd encrypts by
+# default, so against a dev server with a self-signed certificate pass `-C`.
 RUN . /etc/os-release \
     && curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb" -o /tmp/pmp.deb \
     && dpkg -i /tmp/pmp.deb && rm /tmp/pmp.deb \
     && apt-get update \
-    && apt-get install -y --no-install-recommends sqlcmd \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-tools18 \
+    && ln -s /opt/mssql-tools18/bin/sqlcmd /usr/local/bin/sqlcmd \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && sqlcmd --version
+    && sqlcmd -? | head -n 2
 
 # --- .NET SDK check ---------------------------------------------------------
 # The SDK comes from the base image. Fail the build loudly if that tag ever stops
