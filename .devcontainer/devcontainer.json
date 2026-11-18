@@ -33,11 +33,11 @@
   // NUGET_PACKAGES, ASPNETCORE_URLS, ArtifactsPath and DISABLE_AUTOUPDATER are
   // already set by the image's ENV, so they are not repeated here.
   "containerEnv": {
-    // Connection string to your EXTERNAL postgres. host.docker.internal points
+    // Connection string to your EXTERNAL SQL Server. host.docker.internal points
     // at a DB running on your laptop; swap in a real host for a remote service.
     // ASP.NET Core binds ConnectionStrings__Default to
     // builder.Configuration.GetConnectionString("Default").
-    "ConnectionStrings__Default": "Host=host.docker.internal;Port=5432;Database=app;Username=postgres;Password=postgres"
+    "ConnectionStrings__Default": "Server=host.docker.internal,1433;Database=app;User Id=sa;Password=Your_strong_Passw0rd;TrustServerCertificate=True"
   },
 
   // ASP.NET Core dev server. Open it from the VS Code Ports tab.

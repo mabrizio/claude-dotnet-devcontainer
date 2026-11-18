@@ -186,31 +186,31 @@ it — your shell history and any container-side state come back.
 
 ## 5. Connecting to a database
 
-The container ships the `psql` client and maps `host.docker.internal` to your
+The container ships the `sqlcmd` client and maps `host.docker.internal` to your
 host.
 
 - **DB on your laptop:** the default connection string
-  (`Host=host.docker.internal;Port=5432;Database=app;Username=postgres;Password=postgres`)
+  (`Server=host.docker.internal,1433;Database=app;User Id=sa;Password=Your_strong_Passw0rd;TrustServerCertificate=True`)
   already points there. It reaches your app as `ConnectionStrings__Default`, which
   ASP.NET Core binds to `builder.Configuration.GetConnectionString("Default")`.
-  Test connectivity with `psql`, which wants libpq-style arguments rather than the
-  Npgsql string:
+  Test connectivity with `sqlcmd`, which takes its own arguments rather than the
+  connection string:
 
   ```bash
-  psql "host=host.docker.internal port=5432 dbname=app user=postgres" -c '\l'
+  sqlcmd -S host.docker.internal,1433 -U sa -P 'Your_strong_Passw0rd' -C -Q 'SELECT name FROM sys.databases'
   ```
-- **Remote/hosted DB:** pass a different Npgsql connection string when starting the
+- **Remote/hosted DB:** pass a different SQL Server connection string when starting the
   container (`claude-box-dotnet` masks the password in its status output):
 
   ```bash
-  DB_CONNECTION_STRING='Host=db.example.com;Port=5432;Database=mydb;Username=user;Password=pass' claude-box-dotnet start
+  DB_CONNECTION_STRING='Server=db.example.com,1433;Database=mydb;User Id=user;Password=pass;TrustServerCertificate=True' claude-box-dotnet start
   ```
 
 The database itself is **external** — this container never runs or manages it.
 
 ### Or: run your app + a local DB with Compose
 
-If you'd rather spin up the application **and** a throwaway Postgres for
+If you'd rather spin up the application **and** a throwaway SQL Server for
 development, define them in a `compose.yaml` **in your project** (separate from
 the dev container). A ready-to-copy example is in
 [examples/compose.yaml](examples/compose.yaml):
@@ -218,16 +218,16 @@ the dev container). A ready-to-copy example is in
 ```bash
 cp ~/tools/claude-dotnet-devcontainer/examples/compose.yaml ~/Projects/my-app/compose.yaml
 cd ~/Projects/my-app
-docker compose up        # starts the app (with live reload) + Postgres
+docker compose up        # starts the app (with live reload) + SQL Server
 ```
 
 This stays **independent** of the dev container, by design:
 
 - The `api` service bind-mounts the **same project directory** the Claude dev
   container edits, so changes appear live and `dotnet watch` restarts the app.
-- `db` publishes `5432` to the host, so the Claude dev container reaches it at the
-  default `host.docker.internal:5432`, while `api` reaches it in-network at
-  `db:5432`. Two stacks, decoupled.
+- `db` publishes `1433` to the host, so the Claude dev container reaches it at the
+  default `host.docker.internal:1433`, while `api` reaches it in-network at
+  `db:1433`. Two stacks, decoupled.
 - The app's NuGet cache and build output live in named volumes (outside the mount),
   so no `bin/` or `obj/` leaks into your repo from the compose stack.
 
@@ -235,8 +235,8 @@ Edit the `command:` in the example to point at your web project's `.csproj`.
 
 Run `claude-box-dotnet start` for the dev container and `docker compose up` for the app —
 they coexist. Running several projects with local DBs? Give each project's compose a
-different host port (`5433:5432`, …) and start its dev container with a matching
-`DB_CONNECTION_STRING=…Port=5433… claude-box-dotnet start`.
+different host port (`1434:1433`, …) and start its dev container with a matching
+`DB_CONNECTION_STRING=…Server=host.docker.internal,1434… claude-box-dotnet start`.
 
 ---
 
@@ -380,7 +380,7 @@ after every image rebuild.
 | ---------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `IMAGE`        | `claude-dotnet-devcontainer:latest` | image tag to run (and to build, for `build-image`)                                                                                       |
 | `PORT`         | auto-assigned                         | pin a fixed host port mapped to container`:8080`; by default each container gets a free port automatically, so several can run at once |
-| `DB_CONNECTION_STRING` | `Host=host.docker.internal;Port=5432;Database=app;…` | external Postgres, Npgsql format; injected into the container as `ConnectionStrings__Default`. The password is masked in `claude-box-dotnet` output |
+| `DB_CONNECTION_STRING` | `Server=host.docker.internal,1433;Database=app;…` | external SQL Server, SqlClient format; injected into the container as `ConnectionStrings__Default`. The password is masked in `claude-box-dotnet` output |
 | `CONTAINER_USER` | `vscode` | the non-root user inside the image (change only if you change the Dockerfile's `USERNAME`) |
 | `PROJECT_CODE_NAME` | the project directory's basename | label shown in the container's shell prompt in place of the username: `myproject ➜ /workspace (main) $`. Set it when the directory name is unhelpful (`src`, `app`, `repo`) |
 | `GIT_USER_NAME`  | your host `git config user.name`  | commit author name inside the container                                                                                                  |

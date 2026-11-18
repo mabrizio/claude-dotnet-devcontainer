@@ -23,7 +23,7 @@
 # Env overrides:
 #   IMAGE         image tag to use/build      (default: claude-dotnet-devcontainer:latest)
 #   PORT          fixed host port -> :8080     (default: auto-assigned, conflict-free)
-#   DB_CONNECTION_STRING  external Postgres, Npgsql format, injected as
+#   DB_CONNECTION_STRING  external SQL Server, SqlClient format, injected as
 #                 ConnectionStrings__Default   (default: host.docker.internal)
 #   CONTAINER_USER  non-root user inside the image (default: vscode)
 #   PROJECT_CODE_NAME  label shown in the container's shell prompt in place of the
@@ -43,7 +43,7 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-claude-dotnet-devcontainer:latest}"
-DB_CONNECTION_STRING="${DB_CONNECTION_STRING:-Host=host.docker.internal;Port=5432;Database=app;Username=postgres;Password=postgres}"
+DB_CONNECTION_STRING="${DB_CONNECTION_STRING:-Server=host.docker.internal,1433;Database=app;User Id=sa;Password=Your_strong_Passw0rd;TrustServerCertificate=True}"
 
 # The non-root user baked into the image (see the Dockerfile's USERNAME arg).
 CONTAINER_USER="${CONTAINER_USER:-vscode}"

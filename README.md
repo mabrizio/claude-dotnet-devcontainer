@@ -1,7 +1,7 @@
 # Claude Code Dev Container — .NET 10 / ASP.NET Core
 
 A customizable, isolated dev container for running **Claude Code** against a
-.NET 10 + ASP.NET Core + PostgreSQL project. Claude runs *inside* the container, so it
+.NET 10 + ASP.NET Core + SQL Server project. Claude runs *inside* the container, so it
 can operate unrestricted (`--dangerously-skip-permissions`) without touching your
 host machine. Your repo is bind-mounted, so edits appear live in your editor.
 
@@ -18,7 +18,7 @@ repo stays bind-mounted and live-editable. The **custom image is the point**: yo
 own the Dockerfile, so you can add any system tools, language runtimes, or CLIs a
 project needs.
 
-The .NET 10 (LTS) + ASP.NET Core + PostgreSQL stack is the *worked example* that ships with
+The .NET 10 (LTS) + ASP.NET Core + SQL Server stack is the *worked example* that ships with
 it — a clean starting point — not the end goal.
 
 ### Goals
@@ -27,7 +27,7 @@ it — a clean starting point — not the end goal.
   the VS Code extension.
 - Make the image **easy to customize** — adding tools should be a clean,
   documented one-liner in the Dockerfile (see [Customizing](#customizing)).
-- Provide a solid .NET 10 + ASP.NET Core + PostgreSQL worked example so the container
+- Provide a solid .NET 10 + ASP.NET Core + SQL Server worked example so the container
   is useful out of the box.
 
 ## What's in here
@@ -45,7 +45,7 @@ it — a clean starting point — not the end goal.
 ├── build-image                  # MAINTAINER: build the image from .devcontainer/
 ├── claude-box-dotnet               # USERS: run/manage a container per project, then attach
 ├── examples/
-│   ├── compose.yaml             # sample PROJECT compose (app + Postgres) to copy into your project
+│   ├── compose.yaml             # sample PROJECT compose (app + SQL Server) to copy into your project
 │   ├── .pre-commit-config.yaml  # sample PROJECT pre-commit hooks (dotnet format + guards)
 │   └── claude-settings.json     # sample PROJECT .claude/settings.json (format-on-edit hook)
 ├── CLAUDE.md                    # project context Claude reads automatically
@@ -71,7 +71,7 @@ CLI but no project files. You mount whatever project directory you want at
   that doesn't suit you, drop it and keep only the open-source C# extension — see
   [Customizing](#customizing).
 - A Claude subscription or Anthropic API access (you sign in on first run)
-- A reachable PostgreSQL instance (external — not managed by this container)
+- A reachable SQL Server instance (external — not managed by this container)
 - **Only if you want Docker to work *inside* the container:** a remote Docker
   host reachable over SSH, plus the `op` CLI to fetch its key — see
   [Remote Docker daemon](#remote-docker-daemon). Everything else works without it.
@@ -173,7 +173,7 @@ docker run -d --name claude-dotnet \
   -v claude-nuget-cache:/home/vscode/.nuget/packages \
   -v claude-pre-commit-cache:/home/vscode/.cache/pre-commit \
   -e PRE_COMMIT_HOME=/home/vscode/.cache/pre-commit \
-  -e ConnectionStrings__Default="Host=host.docker.internal;Port=5432;Database=app;Username=postgres;Password=postgres" \
+  -e ConnectionStrings__Default="Server=host.docker.internal,1433;Database=app;User Id=sa;Password=Your_strong_Passw0rd;TrustServerCertificate=True" \
   -e PROJECT_CODE_NAME="$(basename "$PWD")" \
   -e DOCKER_HOST="ssh://dockerizer@192.168.122.10" \
   -p 8080 claude-dotnet-devcontainer
@@ -273,7 +273,7 @@ shared, mountable image.
 > **Docker inside the container does not work in this flow.** The remote-daemon
 > SSH key is injected at run time by `claude-box-dotnet start`, and Reopen-in-Container
 > has no equivalent hook, so `DOCKER_HOST` is left unset rather than set and
-> broken. Everything else — .NET, `dotnet format`, psql, Claude Code — works normally.
+> broken. Everything else — .NET, `dotnet format`, sqlcmd, Claude Code — works normally.
 > Use `claude-box-dotnet` if you need Claude to build or run containers.
 
 ## Remote Docker daemon
@@ -297,7 +297,7 @@ allowed to run Docker. It is Claude's test bench: while working on your project
 inside the container, Claude can use it to:
 
 - `docker build` the project's images and `docker run` them;
-- bring up whole stacks with `docker compose up` (app + PostgreSQL + Redis, message
+- bring up whole stacks with `docker compose up` (app + SQL Server + Redis, message
   brokers, etc.) and run integration or end-to-end tests against them;
 - exercise the project's own `Dockerfile` and `compose.yaml` the way CI or
   production would, rather than only running `dotnet run` in the sandbox;
@@ -492,7 +492,7 @@ nothing in this repo or the image needs to change.
 
 ## Connecting to your database
 
-The container only needs the `psql` client (included) and network reachability.
+The container only needs the `sqlcmd` client (included) and network reachability.
 
 - **DB on your laptop:** `host.docker.internal` resolves to the host (the
   `--add-host` runArg enables this on Linux). The default connection string already
@@ -502,17 +502,16 @@ The container only needs the `psql` client (included) and network reachability.
   firewall, add that host to its allowlist.
 
 The string is injected as `ConnectionStrings__Default` — the ASP.NET Core
-configuration convention (`__` stands for the `:` section separator), in Npgsql's
-key/value format. Npgsql does not accept `postgresql://` URIs in a plain
-connection string. In your app:
+configuration convention (`__` stands for the `:` section separator), in SqlClient's
+key/value format (`Server=host,port;...`). In your app:
 
 ```csharp
 var cs = builder.Configuration.GetConnectionString("Default");
-builder.Services.AddNpgsqlDataSource(cs!);   // Npgsql.DependencyInjection
+builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlServer(cs));   // Microsoft.EntityFrameworkCore.SqlServer
 ```
 
-Test it with `psql` (it needs a libpq-style string, not the Npgsql one):
-`psql "host=host.docker.internal port=5432 dbname=app user=postgres" -c '\l'`
+Test it with `sqlcmd` (it takes its own arguments, not the connection string):
+`sqlcmd -S host.docker.internal,1433 -U sa -P 'Your_strong_Passw0rd' -C -Q 'SELECT name FROM sys.databases'`
 
 ## Customizing
 

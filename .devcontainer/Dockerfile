@@ -11,7 +11,7 @@ FROM mcr.microsoft.com/devcontainers/dotnet:10.0
 ARG USERNAME=vscode
 
 # --- System tools -----------------------------------------------------------
-# postgresql-client            -> `psql` to talk to an external database
+# sqlcmd (go-sqlcmd, below)    -> `sqlcmd` to talk to an external SQL Server
 # iptables / ipset / dnsutils  -> needed only by the optional egress firewall
 # ripgrep                      -> fast code search
 # python3 / pipx               -> ONLY so `pre-commit` can be installed below. Python
@@ -23,7 +23,6 @@ ARG USERNAME=vscode
 #     clang zlib1g-dev \
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends \
-        postgresql-client \
         iptables ipset dnsutils \
         ripgrep \
         jq \
@@ -50,6 +49,17 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && apt-get update \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# --- sqlcmd (SQL Server client) ---------------------------------------------
+# go-sqlcmd from Microsoft's apt repo: a plain `sqlcmd` on PATH, no EULA prompt,
+# available for amd64 and arm64.
+RUN . /etc/os-release \
+    && curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb" -o /tmp/pmp.deb \
+    && dpkg -i /tmp/pmp.deb && rm /tmp/pmp.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends sqlcmd \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && sqlcmd --version
 
 # --- .NET SDK check ---------------------------------------------------------
 # The SDK comes from the base image. Fail the build loudly if that tag ever stops
@@ -153,7 +163,7 @@ ENV PATH="/home/${USERNAME}/.local/bin:/home/${USERNAME}/.dotnet/tools:/usr/sbin
 # the CLAUDE_INSTALL_BUST ARG on purpose, so a routine "newest Claude" rebuild
 # stays fast; `build-image --full` is how you refresh them.
 #   pre-commit — cross-language git hooks (the only thing python3/pipx is for).
-#   dotnet-ef  — EF Core CLI, the natural companion to Postgres.
+#   dotnet-ef  — EF Core CLI, the natural companion to SQL Server.
 # `dotnet format` is built into the SDK, so it is not installed here.
 RUN pipx install pre-commit && pre-commit --version
 RUN dotnet tool install --global dotnet-ef && dotnet ef --version

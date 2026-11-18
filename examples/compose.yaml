@@ -2,7 +2,7 @@
 # `compose.yaml`. It is NOT part of the claude-dotnet-devcontainer image and is
 # not used by claude-box-dotnet; it defines how your application runs.
 #
-#   docker compose up            # start the app + a local Postgres
+#   docker compose up            # start the app + a local SQL Server
 #   docker compose up -d         # ... in the background
 #   docker compose down          # stop everything
 #
@@ -10,9 +10,9 @@
 #   * The `api` service bind-mounts the SAME project directory that the Claude
 #     dev container edits (`.` -> /app), so changes appear live and `dotnet watch`
 #     restarts the app automatically.
-#   * `db` publishes 5432 to the host, so the Claude dev container reaches it at
-#     host.docker.internal:5432 (the default ConnectionStrings__Default), while
-#     `api` reaches it in-network at db:5432. The two stacks stay decoupled.
+#   * `db` publishes 1433 to the host, so the Claude dev container reaches it at
+#     host.docker.internal:1433 (the default ConnectionStrings__Default), while
+#     `api` reaches it in-network at db:1433. The two stacks stay decoupled.
 #
 # Assumes a .NET 10 ASP.NET Core project; adjust the project path below.
 
@@ -36,7 +36,7 @@ services:
       # Same mechanism as the dev container image: MSBuild reads this env var, so
       # no bin/ or obj/ leaks into the repo from the compose stack either.
       ArtifactsPath: /artifacts
-      ConnectionStrings__Default: Host=db;Port=5432;Database=app;Username=postgres;Password=postgres
+      ConnectionStrings__Default: Server=db,1433;Database=app;User Id=sa;Password=Your_strong_Passw0rd;TrustServerCertificate=True
     ports:
       - "8080:8080"
     depends_on:
@@ -44,22 +44,22 @@ services:
         condition: service_healthy
 
   db:
-    image: postgres:16
+    image: mcr.microsoft.com/mssql/server:2022-latest
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: app
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: Your_strong_Passw0rd   # must meet SQL Server's complexity rules
     ports:
-      - "5432:5432"                  # published so the Claude dev container can reach it via host.docker.internal
+      - "1433:1433"                  # published so the Claude dev container can reach it via host.docker.internal
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mssqldata:/var/opt/mssql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 12
+      start_period: 20s
 
 volumes:
   nuget:       # the app's NuGet package cache (outside the bind mount)
   artifacts:   # build output (outside the bind mount)
-  pgdata:      # Postgres data, persists across `docker compose down`
+  mssqldata:   # SQL Server data, persists across `docker compose down`

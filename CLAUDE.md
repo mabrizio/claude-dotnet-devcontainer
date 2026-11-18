@@ -7,7 +7,7 @@ each session. Keep it short, factual, and current.
 
 The product is the **dev container template** in `.devcontainer/` — a reusable,
 customizable image for running Claude Code unrestricted in isolation (see the
-README's "The idea"). The C# / .NET 10 + ASP.NET Core + PostgreSQL stack below is
+README's "The idea"). The C# / .NET 10 + ASP.NET Core + SQL Server stack below is
 the **worked example** the container ships with, not a goal in itself. There is no
 application code yet; the stack/commands describe the example workload you build
 *inside* the container.
@@ -59,8 +59,8 @@ so a pager configured in that copied gitconfig resolves.
 
 - **Language/runtime:** C# on **.NET 10 (LTS)**
 - **Web framework:** ASP.NET Core (minimal APIs by default)
-- **Database:** PostgreSQL (external — not run inside this container) via
-  **Npgsql** (+ EF Core optional)
+- **Database:** SQL Server (external — not run inside this container) via
+  **Microsoft.Data.SqlClient** (+ EF Core SqlServer provider optional)
 - **Package manager:** NuGet through the `dotnet` CLI; central versions via
   `Directory.Packages.props` (recommended), lockfiles via
   `RestorePackagesWithLockFile` (`packages.lock.json`)
@@ -91,7 +91,7 @@ Two situations, and it matters which you are in:
 - The API listens on plain HTTP `:8080` (`ASPNETCORE_URLS`); there is no HTTPS dev
   certificate in the container.
 - The database connection string is in the `ConnectionStrings__Default`
-  environment variable (Npgsql key/value format, *not* a `postgresql://` URI).
+  environment variable (SqlClient key/value format, e.g. `Server=host,1433;Database=app;User Id=sa;Password=…;TrustServerCertificate=True`).
 
 ## Commands
 
@@ -110,7 +110,7 @@ Always use the `dotnet` CLI:
 | Format | `dotnet format` |
 | Verify formatting only | `dotnet format --verify-no-changes` |
 | EF migrations | `dotnet ef migrations add <Name>` / `dotnet ef database update` — **confirm before `database update`** (see below) |
-| DB shell | `psql "host=… dbname=…"` (libpq syntax — parse it out of `ConnectionStrings__Default`) |
+| DB shell | `sqlcmd -S host,1433 -U user -P pass -C` (parse it out of `ConnectionStrings__Default`) |
 
 > `dotnet format whitespace --folder` needs no restore/build and is fast; the full
 > `dotnet format` (style + analyzers) is solution-level and slower.
