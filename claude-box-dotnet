@@ -455,7 +455,7 @@ install_ssh_key() {
   echo "Installed remote-Docker SSH key into '$NAME': $fp"
 }
 
-# Warn loudly if the container has no usable key: `docker` inside it targets the
+# Note (not an error) when the container has no usable key: `docker` inside it targets the
 # remote VM over SSH, and the failure you'd otherwise get is an opaque auth error
 # a long way from the cause.
 check_ssh_key() {
@@ -464,12 +464,13 @@ check_ssh_key() {
   fi
   cat >&2 <<EOF
 
-WARNING: no SSH key in '$NAME'. Docker commands inside the container
-         (DOCKER_HOST=ssh://${REMOTE_DOCKER_USER}@${REMOTE_DOCKER_HOST}) will fail.
-         Export $(org_var DOCKER_SSH_KEY_OP_REF) with a 1Password reference, or
-         run 'claude-box-dotnet seal ssh-key <file>' and 'provider openssl'
-         (see the README, "Remote Docker daemon"), or set DOCKER_SSH_KEY to the
-         key material, then re-run 'claude-box-dotnet start'. Everything else works without it.
+NOTE: no SSH key in '$NAME', so the remote Docker host
+      (ssh://${REMOTE_DOCKER_USER}@${REMOTE_DOCKER_HOST}) is not available for
+      automated container testing. This is optional; everything else works.
+      To enable it, export $(org_var DOCKER_SSH_KEY_OP_REF) with a 1Password reference,
+      or run 'claude-box-dotnet seal ssh-key <file>' and 'provider openssl'
+      (see the README, "Remote Docker daemon"), or set DOCKER_SSH_KEY, then
+      re-run 'claude-box-dotnet start'.
 EOF
 }
 

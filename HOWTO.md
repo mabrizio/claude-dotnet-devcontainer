@@ -376,18 +376,27 @@ after every image rebuild.
 
 ## Secrets providers: 1Password or OpenSSL
 
-The Claude token and the remote-Docker SSH key can come from either of two
-providers. Pick whichever suits you; 1Password is the default.
+There are two optional secrets:
+
+- the **Claude Code token**, so Claude Code in the container starts logged in
+  (without it you log in interactively);
+- the **Docker host SSH key**, for connecting to a separate host that runs OpenSSH
+  and Docker, where the containers Claude builds and tests are created. Without it
+  the Docker host is simply not available for automated testing; everything else
+  works.
+
+Either can come from either of two providers. Pick whichever suits you; 1Password
+is the default.
 
 - **1Password** (default): export `CLAUDE_TOKEN_OP_REF` and `DOCKER_SSH_KEY_OP_REF`
   (see the variable table below). Nothing else to set up.
 - **OpenSSL**: keep the secrets in files encrypted with a passphrase of your choice.
-  Run `claude setup-token` to get a Claude token, then:
+  Run `claude setup-token` to get a Claude Code token, then:
 
   ```bash
   claude-box-dotnet provider openssl              # make it your default
-  claude-box-dotnet seal token                    # type the token, then a passphrase
-  claude-box-dotnet seal ssh-key <keyfile>        # encrypt your SSH private key
+  claude-box-dotnet seal token                    # type the Claude Code token, then a passphrase
+  claude-box-dotnet seal ssh-key <keyfile>        # encrypt the Docker host's SSH private key
   ```
 
   `start` then asks for the passphrase when it needs a secret.
@@ -417,8 +426,8 @@ committed, never baked into the image:
 
 | Variable | Purpose |
 | --- | --- |
-| `CLAUDE_TOKEN_OP_REF` | 1Password reference for a long-lived Claude OAuth token, so login survives container recreation |
-| `DOCKER_SSH_KEY_OP_REF` | 1Password reference for the SSH **private key** (stored base64-encoded) that reaches the remote Docker host |
+| `CLAUDE_TOKEN_OP_REF` | 1Password reference for a long-lived Claude Code OAuth token, so login survives container recreation |
+| `DOCKER_SSH_KEY_OP_REF` | 1Password reference for the SSH **private key** (stored base64-encoded) used to connect to the remote Docker host (OpenSSH + Docker) |
 | `OP_SERVICE_ACCOUNT_TOKEN` | 1Password service-account token, so `op` can read the two above non-interactively |
 | `DOCKER_SSH_KEY` | the SSH key material directly, bypassing the provider |
 | `SECRET_PROVIDER` | `1password` (default) or `openssl`; overrides the saved default (`claude-box-dotnet provider <name>`) for one run |
@@ -437,9 +446,10 @@ store — and `claude-box-dotnet start` refuses to reuse a container that was cr
 a different `CLAUDE_ORG` rather than silently mounting the wrong account's credentials.
 See the README's "Namespacing with `CLAUDE_ORG`" for the full precedence rules.
 
-Both are optional. Without the Claude token you just log in interactively; without
-the SSH key everything works except `docker` **inside** the container, and
-`claude-box-dotnet` warns you at start. See the README's "Remote Docker daemon" section
+Both are optional. Without the Claude Code token you just log in interactively; without
+the SSH key everything works except `docker` **inside** the container (the remote
+Docker host isn't available for automated testing), and `claude-box-dotnet` prints a
+note at start. See the README's "Remote Docker daemon" section
 for why Docker is remote at all.
 
 Example: `PORT=8001 claude-box-dotnet start ~/Projects/second-app`

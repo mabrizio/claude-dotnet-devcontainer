@@ -40,8 +40,10 @@ secrets from 1Password on the host and injects them into the running container:
 - `CLAUDE_ORG` optionally prefixes the variable names (`CLAUDE_ORG=acme` →
   `ACME_CLAUDE_TOKEN_OP_REF`), and also namespaces the Claude credentials volume
   so two organizations never share one login.
-- `CLAUDE_TOKEN_OP_REF` → a long-lived Claude OAuth token.
-- `DOCKER_SSH_KEY_OP_REF` → the SSH key for the remote Docker host, stored
+- `CLAUDE_TOKEN_OP_REF` → a long-lived Claude Code OAuth token (optional; without it, log in interactively).
+- `DOCKER_SSH_KEY_OP_REF` → the SSH key for the remote Docker host (a host running
+  OpenSSH + Docker where test containers run; optional — without it that host is
+  just unavailable for automated testing), stored
   **base64-encoded**. It is written over stdin, decoded and validated inside the
   container, and only then moved into `~/.ssh/id_rsa`.
 

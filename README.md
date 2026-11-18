@@ -55,7 +55,7 @@ it — a clean starting point — not the end goal.
 └── README.md
 ```
 
-No secrets live in this tree. The SSH key and the Claude token are resolved from
+No secrets live in this tree. The Docker-host SSH key and the Claude Code token are resolved from
 1Password at start time — see [Remote Docker daemon](#remote-docker-daemon).
 
 The **image is generic** — it bundles the .NET 10 SDK and the Claude Code
@@ -126,8 +126,8 @@ no directory:
 | `claude-box-dotnet shell [DIR]` | Open an interactive shell inside it |
 | `claude-box-dotnet info [DIR]` | Show status, image, workspace, and mapped port |
 | `claude-box-dotnet provider [1password\|openssl]` | Show, or set, the default secrets provider (saved in `~/.config/claude-box/config`) |
-| `claude-box-dotnet seal token` | Create the openssl-encrypted Claude token file (hidden prompt, then a passphrase) |
-| `claude-box-dotnet seal ssh-key FILE` | Create the openssl-encrypted SSH key file from an existing private key |
+| `claude-box-dotnet seal token` | Create the openssl-encrypted Claude Code token file (hidden prompt, then a passphrase) |
+| `claude-box-dotnet seal ssh-key FILE` | Create the openssl-encrypted Docker-host SSH key file from an existing private key |
 
 `provider` and `seal` are explained in [Secrets: 1Password or encrypted
 files](#secrets-1password-or-encrypted-files).
@@ -191,7 +191,7 @@ docker exec -u root claude-dotnet chown vscode:vscode \
   /home/vscode/.claude/projects /home/vscode/.nuget/packages /home/vscode/.cache/pre-commit
 ```
 
-Two things `claude-box-dotnet` does that this doesn't: it resolves the Claude token and
+Two things `claude-box-dotnet` does that this doesn't: it resolves the Claude Code token and
 the remote-Docker SSH key from 1Password and injects them, so here you would log
 in interactively and place `~/.ssh/id_rsa` yourself (mode 600) before `docker`
 inside the container can reach the remote daemon.
@@ -253,7 +253,7 @@ inside the container can reach the remote daemon.
 - **Docker inside the container targets a remote daemon.** There's no daemon in
   here — `docker` talks over SSH to a separate host, so containers Claude builds
   never land on your laptop. See [Remote Docker daemon](#remote-docker-daemon).
-- **The image holds no secrets.** The SSH key and Claude token are resolved from
+- **The image holds no secrets.** The Docker-host SSH key and Claude Code token are resolved from
   1Password on the host at start time and injected into the running container.
 - **VS Code copies your host `~/.gitconfig` in on attach.** That's the extension's
   own behaviour, not `claude-box-dotnet`. It brings your aliases and pager settings
@@ -500,6 +500,23 @@ nothing in this repo or the image needs to change.
 
 ## Secrets: 1Password or encrypted files
 
+### The two secrets
+
+Both are **optional**:
+
+- **Claude Code token** (`CLAUDE_CODE_OAUTH_TOKEN`): a long-lived login token for
+  Claude Code itself, created with `claude setup-token`. It lets Claude Code inside
+  the container start already logged in and stay logged in when the container is
+  recreated. Without it you simply log in interactively.
+- **Docker host SSH key**: the private key used to connect to a separate host that
+  runs OpenSSH and Docker. Containers that Claude builds and runs (to test your
+  project, bring up compose stacks, run integration tests) are created **on that
+  host**, never on yours; see [Remote Docker daemon](#remote-docker-daemon). If no
+  key is defined, that is not a problem: it only means the Docker host isn't
+  available for automated testing, and everything else works normally.
+
+### Choosing a provider
+
 Two providers are supported; you pick **one** as your default and there is no silent
 fallback between them. A `DOCKER_SSH_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` exported
 directly always wins over either provider.
@@ -518,15 +535,15 @@ claude-box-dotnet provider openssl    # make openssl the default
 SECRET_PROVIDER=1password claude-box-dotnet start   # override for one run
 ```
 
-### Getting the Claude token
+### Getting the Claude Code token
 
 On the host, run `claude setup-token`. It opens a browser login and prints a
-long-lived OAuth token (requires a Claude subscription). Store it with either
+long-lived Claude Code OAuth token (requires a Claude subscription). Store it with either
 provider:
 
 - **1Password:** save it in an item and export `CLAUDE_TOKEN_OP_REF`
   (e.g. `op://Private/Claude Code/credential`).
-- **openssl:** `claude-box-dotnet seal token` — paste the token at the hidden prompt
+- **openssl:** `claude-box-dotnet seal token` — paste the Claude Code token at the hidden prompt
   (surrounding whitespace and the newline are stripped), then choose a passphrase.
 
 ### The openssl provider
