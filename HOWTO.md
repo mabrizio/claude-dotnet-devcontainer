@@ -33,11 +33,11 @@ The model: **one image, built once, mounted into any project directory.** You do
 
    The helper always takes a subcommand. The container commands — `start`,
    `stop`, `rm`, `shell` and `info` — take an optional project directory (default:
-   the current one). `provider` and `seal` manage your secrets setup (`provider` takes no
-   directory; see "Secrets providers" below). Run
+   the current one). `provider` and `seal` manage your secrets setup (they act on the project, or
+   take `--user` for your per-user default; see "Secrets providers" below). Run
    `claude-box-dotnet help` for the full list.
 3. Make sure **Docker** and **VS Code + the Dev Containers extension** are
-   installed, then build the image once:
+   installed (see "0b. Set up VS Code" below), then build the image once:
 
    ```bash
    ~/tools/claude-dotnet-devcontainer/build-image
@@ -55,6 +55,82 @@ The model: **one image, built once, mounted into any project directory.** You do
    this and everything else still works — you just get a warning at start.
    Creating or rotating a key (including putting the **public** half on the remote
    host) is covered by "Provisioning a new key" in the README.
+
+---
+
+## 0b. Set up VS Code (one time)
+
+You drive Claude from VS Code attached to the running container. Only the **host**
+needs setting up by hand; everything inside the container is installed for you.
+
+### On your host
+
+1. **VS Code** (stable or Insiders).
+2. The **Dev Containers** extension, `ms-vscode-remote.remote-containers`
+   (Extensions view → search "Dev Containers" → Install). This is the only extension
+   you must install yourself.
+3. **Docker running locally**, with the `docker` CLI on your `PATH`: Docker Desktop on
+   macOS/Windows (WSL2 backend on Windows), or Docker Engine on Linux. Dev Containers
+   attaches through it.
+4. A host `git` if you want your git identity mirrored into the container (it is, by
+   `claude-box-dotnet start`).
+
+> **Check your Docker target.** VS Code uses whatever Docker your host shell points
+> at. If your *host* has `DOCKER_HOST` set (for example to a remote machine), Dev
+> Containers will look for the container there and not find it. The dev container
+> itself points at the remote Docker VM from *inside*; your host should talk to its
+> own local Docker.
+
+### Inside the container (installed automatically on attach)
+
+The image tells VS Code to install these into the container when you attach, so you
+don't install them by hand:
+
+| Extension | Id | Why |
+| --- | --- | --- |
+| Claude Code | `anthropic.claude-code` | the Claude panel |
+| C# Dev Kit | `ms-dotnettools.csdevkit` | solution explorer, test explorer, debugging (see the licensing note in the README's Prerequisites) |
+| C# | `ms-dotnettools.csharp` | the language server (open source) |
+| EditorConfig | `editorconfig.editorconfig` | honors your `.editorconfig` |
+| Docker | `ms-azuretools.vscode-docker` | browse the remote Docker host's containers when the SSH key is configured |
+
+It also applies these settings in the container: `dotnet.defaultSolution` is
+disabled (so C# Dev Kit doesn't prompt about a solution), and the Claude Code panel is
+allowed to use **Bypass Permissions** and starts in it
+(`claudeCode.allowDangerouslySkipPermissions` and `claudeCode.initialPermissionMode`),
+which is safe here because the container is isolated.
+
+### Optional extras
+
+- **SQL Server** (`ms-mssql.mssql`): query your database from VS Code. It isn't
+  installed by default; install it from the Extensions view in the attached window, or
+  add it to the image (see "Add VS Code extensions" in the README's Customizing
+  section).
+- **Install an extension everywhere you attach:** add its id to your host
+  `settings.json`:
+
+  ```json
+  "dev.containers.defaultExtensions": ["anthropic.claude-code", "ms-mssql.mssql"]
+  ```
+
+  This is also the fallback if the image's extensions don't auto-install on your
+  VS Code build (see step 3).
+
+### Verify
+
+Attach to the running container (step 3 below), then open the Extensions view: the
+extensions above appear under a **"Dev Container"** section as installed in the
+container. The window's bottom-left corner shows `Container claude-dotnet-<project>-<hash>`.
+
+### Good to know
+
+- On first open VS Code may ask whether you **trust the authors** of the folder;
+  choose **Trust** (it is your own project, inside an isolated container).
+- On attach, the Dev Containers extension copies your host `~/.gitconfig` into the
+  container and can share git credentials. See the README's security notes for what
+  that implies and how to turn it off.
+- A container only picks up image changes (new extensions or settings baked into the
+  image) when you recreate it: `claude-box-dotnet rm` then `claude-box-dotnet start`.
 
 ---
 
@@ -399,7 +475,7 @@ is the default.
   Run `claude setup-token` to get a Claude Code token, then:
 
   ```bash
-  claude-box-dotnet provider openssl              # make it your default
+  claude-box-dotnet provider openssl              # use it for this project (add --user for your default)
   claude-box-dotnet seal token                    # this project's Claude Code token (typed, then a passphrase)
   claude-box-dotnet seal ssh-key <keyfile>        # this project's Docker-host SSH key
   claude-box-dotnet seal ssh-key <keyfile> --user # or a per-user default key
@@ -410,8 +486,10 @@ is the default.
   outside your projects. `start` asks for the passphrase when it needs a secret, and
   offers to copy the token from another project if this one has none.
 
-Switch any time with `claude-box-dotnet provider 1password|openssl`. Full details
-are in the README ("Secrets: 1Password or encrypted files").
+The provider is set per project, with a per-user default as the fallback, so different
+projects can use different providers: `claude-box-dotnet provider openssl` sets it for
+the current project, `claude-box-dotnet provider openssl --user` sets your default, and
+plain `claude-box-dotnet provider` shows which one applies and why. Full details are in the README ("Secrets: 1Password or encrypted files").
 
 ## Optional override env vars
 
@@ -439,7 +517,7 @@ committed, never baked into the image:
 | `DOCKER_SSH_KEY_OP_REF` | 1Password reference for the SSH **private key** (stored base64-encoded) used to connect to the remote Docker host (OpenSSH + Docker) |
 | `OP_SERVICE_ACCOUNT_TOKEN` | 1Password service-account token, so `op` can read the two above non-interactively |
 | `DOCKER_SSH_KEY` | the SSH key material directly, bypassing the provider |
-| `SECRET_PROVIDER` | `1password` (default) or `openssl`; overrides the saved default (`claude-box-dotnet provider <name>`) for one run |
+| `SECRET_PROVIDER` | `1password` (default) or `openssl`; overrides the saved project/user setting (`claude-box-dotnet provider <name> [--user]`) for one run |
 | `CLAUDE_TOKEN_FILE` / `DOCKER_SSH_KEY_FILE` | openssl provider: paths of the encrypted files (explicit path overrides; by default per project under `~/.config/claude-box/projects/`, created by `claude-box-dotnet seal`) |
 | `CLAUDE_SECRETS_PASSPHRASE_FILE` / `CLAUDE_SECRETS_PASSPHRASE` | openssl provider: skip the passphrase prompt (scripting) |
 | `REMOTE_DOCKER_USER` / `REMOTE_DOCKER_HOST` | where `DOCKER_HOST=ssh://…` points (defaults `dockerizer` / `192.168.122.10`) |

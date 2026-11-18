@@ -67,7 +67,8 @@ CLI but no project files. You mount whatever project directory you want at
 ## Prerequisites
 
 - Docker (Docker Desktop on macOS/Windows, or Docker Engine on Linux)
-- VS Code with the **Dev Containers** extension
+- VS Code with the **Dev Containers** extension (the HOWTO's "Set up VS Code" section lists everything,
+  including the extensions the image installs for you)
 - **C# Dev Kit licensing:** the image asks VS Code to install
   `ms-dotnettools.csdevkit`, which has its own license terms (free for individuals,
   open source and small teams; otherwise it needs a Visual Studio subscription). If
@@ -117,8 +118,8 @@ directory — each gets its own container, and they share one Claude login (per 
 when `CLAUDE_ORG` is set; see [Namespacing with `CLAUDE_ORG`](#namespacing-with-claude_org)).
 
 The helper takes a subcommand. The container commands take an optional project
-directory (default: the current one). `provider` is per-user and takes no directory;
-`seal` takes one (or `--user` for the SSH key):
+directory (default: the current one). `provider` and `seal` act on the project the same
+way, and both take `--user` for the per-user default:
 
 | Command | What it does |
 | --- | --- |
@@ -127,7 +128,7 @@ directory (default: the current one). `provider` is per-user and takes no direct
 | `claude-box-dotnet rm [DIR]` | Stop and remove it, so the next `start` builds fresh |
 | `claude-box-dotnet shell [DIR]` | Open an interactive shell inside it |
 | `claude-box-dotnet info [DIR]` | Show status, image, workspace, and mapped port |
-| `claude-box-dotnet provider [1password\|openssl]` | Show, or set, the default secrets provider (saved in `~/.config/claude-box/config`) |
+| `claude-box-dotnet provider [NAME\|unset] [DIR \| --user]` | Show the effective secrets provider, or set it (`1password` \| `openssl`) for the project; `--user` sets the per-user default instead |
 | `claude-box-dotnet seal token [DIR]` | Create the project's openssl-encrypted Claude Code token file (hidden prompt, then a passphrase) |
 | `claude-box-dotnet seal ssh-key FILE [DIR\|--user]` | Create the openssl-encrypted Docker-host SSH key file from an existing private key, for the project or as the per-user default |
 
@@ -553,22 +554,39 @@ nothing in this repo or the image needs to change.
 
 ### Choosing a provider
 
-Two providers are supported; you pick **one** as your default and there is no silent
-fallback between them. A `DOCKER_SSH_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` exported
-directly always wins over either provider.
+Two providers are supported. Each project uses **one** of them (a per-user default
+unless the project overrides it), and there is no silent fallback between them. A
+`DOCKER_SSH_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` exported directly always wins over
+either provider.
 
 | Provider | How secrets are stored | Selected by |
 | --- | --- | --- |
 | `1password` (default) | `op://` references, read with the `op` CLI | nothing — it is the default |
 | `openssl` | files encrypted with `openssl enc` (AES-256-CBC, PBKDF2) in `~/.config/claude-box/` | `claude-box-dotnet provider openssl` |
 
-The choice lives in a per-user file, `~/.config/claude-box/config` (outside the repo,
-never committed; override the directory with `CLAUDE_BOX_CONFIG_DIR`). Show or change it:
+The provider is chosen the same way the secrets are: per project, with a per-user
+default as the fallback. The most specific setting wins:
+
+1. `SECRET_PROVIDER` in the environment (one run only);
+2. the **project's** setting, `~/.config/claude-box/projects/<container-name>/config`;
+3. the **per-user default**, `~/.config/claude-box/config`;
+4. `1password`.
+
+Both files live outside every project and repo (override the directory with
+`CLAUDE_BOX_CONFIG_DIR`). One project can use a 1Password token for one Claude
+account while another uses an encrypted file for a different account.
+
+Like `seal`, `provider` applies to the **project** by default (the current directory,
+or a directory you name), and `--user` selects the per-user default:
 
 ```bash
-claude-box-dotnet provider            # show the current provider and where it came from
-claude-box-dotnet provider openssl    # make openssl the default
-SECRET_PROVIDER=1password claude-box-dotnet start   # override for one run
+claude-box-dotnet provider                       # effective provider for this project, and where it came from
+claude-box-dotnet provider openssl               # set it for THIS project (or: provider openssl ~/Projects/other)
+claude-box-dotnet provider unset                 # drop the project's setting (back to the default)
+claude-box-dotnet provider openssl --user        # set the per-user default
+claude-box-dotnet provider --user                # show the per-user default
+claude-box-dotnet provider unset --user          # remove the per-user default (back to 1password)
+SECRET_PROVIDER=1password claude-box-dotnet start       # override for one run
 ```
 
 ### Getting the Claude Code token

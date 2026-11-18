@@ -12,7 +12,9 @@
       claude-box-dotnet.ps1 rm       [PROJECT_DIR]   stop and remove the container
       claude-box-dotnet.ps1 shell    [PROJECT_DIR]   open a bash shell inside it
       claude-box-dotnet.ps1 info     [PROJECT_DIR]   show status/details
-      claude-box-dotnet.ps1 provider [NAME]          show/set the secrets provider (1password | openssl)
+      claude-box-dotnet.ps1 provider [NAME|unset] [DIR | --user]
+                                                     show/set the secrets provider (1password | openssl)
+                                                     for a project; --user = the per-user default
       claude-box-dotnet.ps1 seal token [DIR]         create this project's encrypted Claude Code token
       claude-box-dotnet.ps1 seal ssh-key FILE [DIR | --user]
                                                      create an encrypted Docker-host SSH key
@@ -90,6 +92,7 @@ $ConfigFile = Join-Path $ConfigDir 'config'
 # State set by the functions below (initialised so StrictMode is happy).
 $Workspace = ''; $Hash = ''; $Name = ''; $ProjectCodeName = ''
 $Provider = '1password'
+$ProviderSource = ''
 $ClaudeToken = ''
 $SshKey = ''
 $GitName = ''; $GitEmail = ''
@@ -106,7 +109,9 @@ Commands:
   rm      [DIR]   Stop and remove the container for DIR (fresh start next time)
   shell   [DIR]   Open an interactive bash shell inside DIR's container
   info    [DIR]   Show status and details for DIR's container
-  provider [NAME] Show, or set, the default secrets provider (1password | openssl)
+  provider [NAME|unset] [DIR | --user]
+                  Show the effective secrets provider, or set it (1password | openssl)
+                  for a project; --user sets the per-user default instead
   seal    token [DIR] | ssh-key FILE [DIR | --user]
                   Create an openssl-compatible encrypted secret file (openssl provider):
                   per project; the SSH key can also be a per-user default (--user)
@@ -205,22 +210,34 @@ function Resolve-Target([string]$Dir) {
 # 1password. There is no silent fallback between providers.
 
 # Read KEY from the config file. Plain KEY=VALUE lines, never executed.
-function Get-ConfigValue([string]$Key) {
-    if (-not (Test-Path -LiteralPath $ConfigFile -PathType Leaf)) { return '' }
-    $line = Get-Content -LiteralPath $ConfigFile | Where-Object { $_ -like "$Key=*" } | Select-Object -Last 1
+function Get-ConfigValue([string]$Key, [string]$File = $ConfigFile) {
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return '' }
+    $line = Get-Content -LiteralPath $File | Where-Object { $_ -like "$Key=*" } | Select-Object -Last 1
     if (-not $line) { return '' }
     return $line.Substring($Key.Length + 1).Trim()
 }
 
+# Sets $Provider and $ProviderSource. Most specific wins: $env:SECRET_PROVIDER, then this
+# project's setting (needs Resolve-Target to have run), then the per-user default, then
+# 1password.
 function Initialize-Provider {
     $p = Get-Env 'SECRET_PROVIDER'
-    if (-not $p) { $p = Get-ConfigValue 'SECRET_PROVIDER' }
-    if (-not $p) { $p = '1password' }
+    $source = 'the SECRET_PROVIDER environment variable'
+    if (-not $p -and $Name) {
+        $p = Get-ConfigValue 'SECRET_PROVIDER' (Get-ProjectConfigFile)
+        $source = "this project ($(Get-ProjectConfigFile))"
+    }
+    if (-not $p) {
+        $p = Get-ConfigValue 'SECRET_PROVIDER'
+        $source = "the per-user default ($ConfigFile)"
+    }
+    if (-not $p) { $p = '1password'; $source = 'the built-in default' }
     $p = $p.ToLowerInvariant()
     if ($p -notin @('1password', 'openssl')) {
         Stop-Script "ERROR: unknown SECRET_PROVIDER '$p' (use 1password or openssl)."
     }
     $script:Provider = $p
+    $script:ProviderSource = $source
 }
 
 # Read one secret from 1Password. $null if `op` is missing or the read fails.
@@ -241,6 +258,10 @@ function Invoke-OpRead([string]$Ref) {
 # kept OUTSIDE the project directory: the project is bind-mounted into the container,
 # so a file there would be visible to it. Keyed by the container name.
 function Get-ProjectSecretDir { Join-Path (Join-Path $ConfigDir 'projects') $Name }
+
+# This project's own settings file (currently just SECRET_PROVIDER), kept next to its
+# secrets and outside the project directory for the same reason.
+function Get-ProjectConfigFile { Join-Path (Get-ProjectSecretDir) 'config' }
 
 # The token file for the current project; CLAUDE_TOKEN_FILE (also CLAUDE_ORG-prefixed)
 # is an explicit path override.
@@ -648,29 +669,67 @@ function Get-ContainerCodeName {
 
 # --- commands ----------------------------------------------------------------------------
 
-# Show or set the default secrets provider (per-user config file, outside the repo).
-function Invoke-Provider([string]$Want) {
-    $want = $Want.ToLowerInvariant()
+# Show or set the secrets provider. Like `seal`, it applies to a PROJECT by default and
+# `--user` selects the per-user default that projects without a setting use.
+#   provider                    show the effective provider for the current project
+#   provider NAME [DIR]         set it for the project (1password | openssl)
+#   provider unset [DIR]        remove the project's setting (falls back to the default)
+#   provider NAME --user        set the per-user default
+#   provider unset --user       remove the per-user default (back to 1password)
+#   provider --user             show the per-user default
+# Both settings live outside every repo, under ~/.config/claude-box.
+function Invoke-Provider([string[]]$ProviderArgs) {
+    $want = ''; $user = $false; $dir = ''
+    foreach ($a in $ProviderArgs) {
+        if (-not $a) { continue }
+        switch -Regex ($a.ToLowerInvariant()) {
+            '^(--user|-user)$' { $user = $true }
+            '^(1password|openssl|unset)$' { $want = $a.ToLowerInvariant() }
+            default { $dir = $a }
+        }
+    }
+    if ($dir -and $user) { Stop-Script 'ERROR: --user is per user; it takes no directory.' 2 }
+
     if (-not $want) {
+        if ($user) {
+            $v = Get-ConfigValue 'SECRET_PROVIDER'
+            Write-Host "Per-user default provider: $(if ($v) { $v } else { '1password (built-in; none set)' })"
+            return
+        }
+        Resolve-Target $dir
         Initialize-Provider
         Write-Host "Secrets provider: $Provider"
-        if (Get-Env 'SECRET_PROVIDER') { Write-Host '  (from the SECRET_PROVIDER environment variable)' }
-        elseif (Get-ConfigValue 'SECRET_PROVIDER') { Write-Host "  (from $ConfigFile)" }
-        else { Write-Host '  (default; set one with: claude-box-dotnet.ps1 provider 1password|openssl)' }
+        Write-Host "  (from $ProviderSource)"
         return
     }
-    if ($want -notin @('1password', 'openssl')) { Stop-Script 'ERROR: provider must be 1password or openssl.' 2 }
-    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
-    Set-PrivateMode $ConfigDir -Directory
-    $keep = @()
-    if (Test-Path -LiteralPath $ConfigFile -PathType Leaf) {
-        $keep = @(Get-Content -LiteralPath $ConfigFile | Where-Object { $_ -notlike 'SECRET_PROVIDER=*' })
+
+    if ($user) { $file = $ConfigFile }
+    else {
+        Resolve-Target $dir
+        $file = Get-ProjectConfigFile
     }
-    $tmp = Join-Path $ConfigDir ('.config.' + [guid]::NewGuid().ToString('N'))
-    Set-Content -LiteralPath $tmp -Value ($keep + "SECRET_PROVIDER=$want")
+    $fileDir = Split-Path -Parent $file
+    New-Item -ItemType Directory -Force -Path $fileDir | Out-Null
+    Set-PrivateMode $ConfigDir -Directory
+    Set-PrivateMode $fileDir -Directory
+
+    $keep = @()
+    if (Test-Path -LiteralPath $file -PathType Leaf) {
+        $keep = @(Get-Content -LiteralPath $file | Where-Object { $_ -notlike 'SECRET_PROVIDER=*' })
+    }
+    $lines = if ($want -eq 'unset') { $keep } else { $keep + "SECRET_PROVIDER=$want" }
+    $tmp = Join-Path $fileDir ('.config.' + [guid]::NewGuid().ToString('N'))
+    Set-Content -LiteralPath $tmp -Value $lines
     Set-PrivateMode $tmp
-    Move-Item -LiteralPath $tmp -Destination $ConfigFile -Force
-    Write-Host "Default secrets provider set to '$want' ($ConfigFile)."
+    Move-Item -LiteralPath $tmp -Destination $file -Force
+
+    if (-not $user) {
+        Save-WorkspaceNote $file
+        if ($want -eq 'unset') { Write-Host "Removed the provider setting for $Workspace (it uses the per-user default again)." }
+        else { Write-Host "Secrets provider for $Workspace set to '$want' ($file)." }
+    }
+    elseif ($want -eq 'unset') { Write-Host 'Removed the per-user default provider (projects without a setting use 1password).' }
+    else { Write-Host "Default secrets provider (per user) set to '$want' ($file)." }
 }
 
 # Create an encrypted secret file for the openssl provider. The secret is never taken
@@ -989,7 +1048,7 @@ switch ($Command) {
     'rm' { Invoke-Rm $first }
     'shell' { Invoke-Shell $first }
     'info' { Invoke-Info $first }
-    'provider' { Invoke-Provider $first }
+    'provider' { Invoke-Provider $Rest }
     'seal' {
         $rc = Invoke-Seal $Rest
         exit $rc

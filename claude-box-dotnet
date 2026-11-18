@@ -40,9 +40,9 @@
 #                            (the prefixed form may also be named <CLAUDE_ORG>_1P_TOKEN)
 #   DOCKER_SSH_KEY           the SSH key material directly, skipping the provider
 #
-# Alternative to 1Password: openssl-encrypted files. Pick the provider once with
-# `claude-box-dotnet provider openssl` (stored in ~/.config/claude-box/config, or
-# override per run with SECRET_PROVIDER), create the files with
+# Alternative to 1Password: openssl-encrypted files. Pick the provider with
+# `claude-box-dotnet provider openssl` (for the current project; add --user for the
+# per-user default in ~/.config/claude-box/config; SECRET_PROVIDER overrides per run), create the files with
 # `claude-box-dotnet seal token` / `seal ssh-key FILE`, and `start` prompts for the
 # passphrase when it needs a secret. Optional overrides:
 #   CLAUDE_TOKEN_FILE, DOCKER_SSH_KEY_FILE   paths (also CLAUDE_ORG-prefixed)
@@ -107,7 +107,9 @@ Commands:
   rm      [DIR]   Stop and remove the container for DIR (fresh start next time)
   shell   [DIR]   Open an interactive bash shell inside DIR's container
   info    [DIR]   Show status and details for DIR's container
-  provider [NAME] Show, or set, the default secrets provider (1password | openssl)
+  provider [NAME|unset] [DIR | --user]
+                  Show the effective secrets provider, or set it (1password | openssl)
+                  for a project; --user sets the per-user default instead
   seal    token [DIR] | ssh-key FILE [DIR | --user]
                   Create an openssl-encrypted secret file (for the openssl provider):
                   per project; the SSH key can also be a per-user default (--user)
@@ -164,6 +166,7 @@ BUILD_SCRIPT="$SCRIPT_DIR/build-image"
 # in the prompt that says WHICH project a terminal is attached to. Overridable from
 # the shell for directories whose name is unhelpful (src, app, repo).
 resolve_target() {
+  [ -d "${1:-$PWD}" ] || { echo "ERROR: not a directory: ${1:-$PWD}" >&2; exit 1; }
   WORKSPACE="$(cd "${1:-$PWD}" && pwd)"
   HASH="$(printf '%s' "$WORKSPACE" | cksum | cut -d' ' -f1)"
   NAME="claude-dotnet-$(basename "$WORKSPACE")-${HASH}"
@@ -189,21 +192,35 @@ CONFIG_DIR="${CLAUDE_BOX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-bo
 CONFIG_FILE="$CONFIG_DIR/config"
 OPENSSL_ARGS=(enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:OPENSSL_PASS)
 
-# Read KEY from the config file. Parsed as plain KEY=VALUE lines, never sourced,
-# so the file can't run code.
+# Read KEY from a config file (default: the per-user one). Parsed as plain KEY=VALUE
+# lines, never sourced, so the file can't run code. Args: <KEY> [FILE]
 config_get() {
-  [ -f "$CONFIG_FILE" ] || return 1
-  local v
-  v="$(sed -n "s/^$1=//p" "$CONFIG_FILE" | tail -n1)"
+  local file="${2:-$CONFIG_FILE}" v
+  [ -f "$file" ] || return 1
+  v="$(sed -n "s/^$1=//p" "$file" | tail -n1)"
   [ -n "$v" ] || return 1
   printf '%s' "$v"
 }
 
-# Sets PROVIDER (not via $(...), so a bad value can abort the script).
+# Sets PROVIDER and PROVIDER_SOURCE (not via $(...), so a bad value can abort the
+# script). Most specific wins: $SECRET_PROVIDER, then this project's setting (needs
+# resolve_target to have run), then the per-user default, then 1password.
 load_provider() {
   PROVIDER="${SECRET_PROVIDER:-}"
-  [ -n "$PROVIDER" ] || PROVIDER="$(config_get SECRET_PROVIDER || true)"
-  PROVIDER="$(printf '%s' "${PROVIDER:-1password}" | tr '[:upper:]' '[:lower:]')"
+  PROVIDER_SOURCE="the SECRET_PROVIDER environment variable"
+  if [ -z "$PROVIDER" ] && [ -n "${NAME:-}" ]; then
+    PROVIDER="$(config_get SECRET_PROVIDER "$(project_config_file)" || true)"
+    PROVIDER_SOURCE="this project ($(project_config_file))"
+  fi
+  if [ -z "$PROVIDER" ]; then
+    PROVIDER="$(config_get SECRET_PROVIDER || true)"
+    PROVIDER_SOURCE="the per-user default ($CONFIG_FILE)"
+  fi
+  if [ -z "$PROVIDER" ]; then
+    PROVIDER=1password
+    PROVIDER_SOURCE="the built-in default"
+  fi
+  PROVIDER="$(printf '%s' "$PROVIDER" | tr '[:upper:]' '[:lower:]')"
   case "$PROVIDER" in
     1password|openssl) ;;
     *) echo "ERROR: unknown SECRET_PROVIDER '$PROVIDER' (use 1password or openssl)." >&2
@@ -231,6 +248,10 @@ ssh_key_file() {
 # container, so a file there would be visible to it. Keyed by the same name the
 # container uses, so it is per project and never in any repo.
 project_secret_dir() { printf '%s/projects/%s' "$CONFIG_DIR" "$NAME"; }
+
+# This project's own settings file (currently just SECRET_PROVIDER), kept next to its
+# secrets and outside the project directory for the same reason.
+project_config_file() { printf '%s/config' "$(project_secret_dir)"; }
 
 # The token file for the current project (resolve_target must have run).
 # CLAUDE_TOKEN_FILE (also CLAUDE_ORG-prefixed) is an explicit path override.
@@ -625,34 +646,69 @@ container_code_name() {
 
 # --- commands ---------------------------------------------------------------
 
-# Show or set the default secrets provider (stored in the per-user config file,
-# which lives outside the repo). Args: [1password|openssl]
+# Show or set the secrets provider. Like `seal`, it applies to a PROJECT by default
+# and `--user` selects the per-user default that projects without a setting use.
+#   provider                    show the effective provider for the current project
+#   provider NAME [DIR]         set it for the project (1password | openssl)
+#   provider unset [DIR]        remove the project's setting (falls back to the default)
+#   provider NAME --user        set the per-user default
+#   provider unset --user       remove the per-user default (back to 1password)
+#   provider --user             show the per-user default
+# Both settings live outside every repo, under ~/.config/claude-box.
 cmd_provider() {
-  local want
-  want="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  local want="" scope=project dir="" a lc
+  for a in "$@"; do
+    [ -n "$a" ] || continue
+    lc="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')"
+    case "$lc" in
+      --user) scope=user ;;
+      1password|openssl|unset) want="$lc" ;;
+      *) dir="$a" ;;
+    esac
+  done
+  if [ -n "$dir" ] && [ "$scope" = user ]; then
+    echo "ERROR: --user is per user; it takes no directory." >&2
+    return 2
+  fi
+
   if [ -z "$want" ]; then
+    if [ "$scope" = user ]; then
+      echo "Per-user default provider: $(config_get SECRET_PROVIDER || echo '1password (built-in; none set)')"
+      return 0
+    fi
+    resolve_target "$dir"
     load_provider
     echo "Secrets provider: $PROVIDER"
-    if [ -n "${SECRET_PROVIDER:-}" ]; then
-      echo "  (from the SECRET_PROVIDER environment variable)"
-    elif config_get SECRET_PROVIDER >/dev/null; then
-      echo "  (from $CONFIG_FILE)"
-    else
-      echo "  (default; set one with: claude-box-dotnet provider 1password|openssl)"
-    fi
+    echo "  (from $PROVIDER_SOURCE)"
     return 0
   fi
-  case "$want" in
-    1password|openssl) ;;
-    *) echo "ERROR: provider must be 1password or openssl." >&2; exit 2 ;;
-  esac
-  mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+
+  local file
+  if [ "$scope" = project ]; then
+    resolve_target "$dir"
+    file="$(project_config_file)"
+    mkdir -p "$(dirname "$file")" && chmod 700 "$CONFIG_DIR" "$(dirname "$file")" 2>/dev/null || true
+  else
+    file="$CONFIG_FILE"
+    mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+  fi
   local tmp
-  tmp="$(umask 077; mktemp "$CONFIG_DIR/.config.XXXXXX")"
-  { [ ! -f "$CONFIG_FILE" ] || grep -v '^SECRET_PROVIDER=' "$CONFIG_FILE" || true
-    printf 'SECRET_PROVIDER=%s\n' "$want"; } > "$tmp"
-  mv "$tmp" "$CONFIG_FILE"
-  echo "Default secrets provider set to '$want' ($CONFIG_FILE)."
+  tmp="$(umask 077; mktemp "$(dirname "$file")/.config.XXXXXX")"
+  { [ ! -f "$file" ] || grep -v '^SECRET_PROVIDER=' "$file" || true
+    [ "$want" = unset ] || printf 'SECRET_PROVIDER=%s\n' "$want"; } > "$tmp"
+  mv "$tmp" "$file"
+  if [ "$scope" = project ]; then
+    note_workspace "$file"
+    if [ "$want" = unset ]; then
+      echo "Removed the provider setting for $WORKSPACE (it uses the per-user default again)."
+    else
+      echo "Secrets provider for $WORKSPACE set to '$want' ($file)."
+    fi
+  elif [ "$want" = unset ]; then
+    echo "Removed the per-user default provider (projects without a setting use 1password)."
+  else
+    echo "Default secrets provider (per user) set to '$want' ($file)."
+  fi
 }
 
 # Create an openssl-encrypted secret file for the openssl provider.
@@ -983,7 +1039,7 @@ case "$CMD" in
   rm)      cmd_rm      "${1:-}" ;;
   shell)   cmd_shell   "${1:-}" ;;
   info)    cmd_info    "${1:-}" ;;
-  provider) cmd_provider "${1:-}" ;;
+  provider) cmd_provider "$@" ;;
   seal)    cmd_seal    "${1:-}" "${2:-}" "${3:-}" ;;
   -h|--help|help) usage 0 ;;
   *) echo "Unknown command: $CMD" >&2; usage 2 ;;

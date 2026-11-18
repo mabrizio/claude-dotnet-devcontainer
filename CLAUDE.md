@@ -59,8 +59,9 @@ Alternative provider: `claude-box-dotnet provider openssl` switches to
 openssl-encrypted files under `~/.config/claude-box/` — outside the project, which is
 mounted into the container — per project (Claude Code token; Docker-host SSH key with
 a per-user fallback), created with `claude-box-dotnet seal token|ssh-key FILE`; `start` prompts for the passphrase only when it needs a
-secret). The default stays 1Password; the choice is per user, stored outside the repo.
-Never commit the `.enc` files.
+secret. The provider itself is per project with a per-user default
+(`provider NAME [DIR | --user]`, project by default like `seal`; env `SECRET_PROVIDER` > project > user > 1password),
+all stored outside the repo. The default stays 1Password. Never commit the `.enc` files.
 
 Never commit a key, never bake one into the image, and never echo a resolved
 secret into logs or chat.
